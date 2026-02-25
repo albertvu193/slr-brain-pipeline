@@ -623,7 +623,7 @@ table.results .expand-btn{color:var(--accent);cursor:pointer;font-size:0.7rem;wh
         <option value="anthropic">Anthropic (Claude)</option>
       </select>
       <label>Model</label>
-      <input type="text" id="model" value="gpt-4o-mini">
+      <select id="model"></select>
       <label>API Key</label>
       <input type="password" id="api-key" placeholder="sk-...">
       <label>Max articles (0 = all)</label>
@@ -813,9 +813,28 @@ function uploadFile(file){
   });
 }
 
+const MODEL_OPTIONS={
+  openai:[
+    {value:'gpt-4o-mini',label:'GPT-4o Mini (fast, cheap)'},
+    {value:'gpt-4o',label:'GPT-4o (balanced)'},
+    {value:'gpt-4.1',label:'GPT-4.1 (latest)'},
+    {value:'gpt-4.1-mini',label:'GPT-4.1 Mini (fast, latest)'},
+    {value:'gpt-4.1-nano',label:'GPT-4.1 Nano (fastest, cheapest)'},
+    {value:'o3-mini',label:'o3-mini (reasoning)'},
+  ],
+  anthropic:[
+    {value:'claude-sonnet-4-20250514',label:'Claude Sonnet 4 (balanced)'},
+    {value:'claude-haiku-4-5-20251001',label:'Claude Haiku 4.5 (fast, cheap)'},
+    {value:'claude-opus-4-20250514',label:'Claude Opus 4 (most capable)'},
+  ]
+};
 function updateModelDefault(){
-  document.getElementById('model').value=document.getElementById('provider').value==='openai'?'gpt-4o-mini':'claude-sonnet-4-20250514';
+  const sel=document.getElementById('model');
+  const provider=document.getElementById('provider').value;
+  const opts=MODEL_OPTIONS[provider]||[];
+  sel.innerHTML=opts.map(o=>'<option value="'+o.value+'">'+escHtml(o.label)+'</option>').join('');
 }
+updateModelDefault();
 
 // --- Run ---
 function startRun(){
