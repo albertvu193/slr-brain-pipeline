@@ -1,0 +1,744 @@
+"""
+SLR Brain v2 — Web UI with Prompt Editor + Intermediate Results Table
+"""
+
+import os, json, time, uuid, threading
+from pathlib import Path
+from flask import Flask, request, jsonify, send_file
+import pandas as pd
+
+# --- AI Provider Abstraction ---
+def call_openai(prompt, system_msg, model, api_key, temperature=0.2):
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key)
+    resp = client.chat.completions.create(
+        model=model, temperature=temperature,
+        messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": prompt}],
+        response_format={"type": "json_object"}
+    )
+    return resp.choices[0].message.content
+
+def call_anthropic(prompt, system_msg, model, api_key, temperature=0.2):
+    import anthropic
+    client = anthropic.Anthropic(api_key=api_key)
+    resp = client.messages.create(
+        model=model, max_tokens=1024, temperature=temperature,
+        system=system_msg, messages=[{"role": "user", "content": prompt}]
+    )
+    return resp.content[0].text
+
+PROVIDERS = {
+    "openai": {"caller": call_openai, "default_model": "gpt-4o-mini"},
+    "anthropic": {"caller": call_anthropic, "default_model": "claude-sonnet-4-20250514"},
+}
+
+# --- Prompt Loader ---
+PROMPT_DIR = Path(__file__).parent / "prompts"
+EXAMPLE_DIR = Path(__file__).parent / "examples"
+
+def load_prompt(filename):
+    return (PROMPT_DIR / filename).read_text()
+
+def load_examples(step_name):
+    path = EXAMPLE_DIR / f"{step_name}.jsonl"
+    if not path.exists():
+        return ""
+    lines = path.read_text().strip().split("\n")
+    examples = [json.loads(l) for l in lines if l.strip()]
+    if not examples:
+        return ""
+    parts = ["\n\n## FEW-SHOT EXAMPLES\n"]
+    for i, ex in enumerate(examples, 1):
+        parts.append(f"### Example {i}")
+        parts.append(f"Title: {ex.get('title', 'N/A')}")
+        parts.append(f"Abstract: {ex.get('abstract', 'N/A')[:500]}")
+        parts.append(f"Expected output: {json.dumps(ex.get('expected', {}))}\n")
+    return "\n".join(parts)
+
+# --- Classification Pipeline ---
+STEPS = [
+    ("01_screener.md",       "screener",  "status",         "Screen",    "Include / Exclude / Background"),
+    ("02_path_classifier.md","path",      "path",           "Path",      "CG→ESG / Both / ESG→FP"),
+    ("03_cg_tagger.md",      "cg",        "cg_mechanisms",  "CG Tags",   "Board, Ownership, etc."),
+    ("04_esg_tagger.md",     "esg",       "esg_outcomes",   "ESG Tags",  "Disclosure, Rating, Pillars"),
+    ("05_meta_scorer.md",    "meta",      "meta_potential",  "Meta Score","High / Medium / Low"),
+]
+
+def classify_article(row, provider_name, api_key, model, job):
+    provider = PROVIDERS[provider_name]
+    caller = provider["caller"]
+    title = str(row.get("Title", row.get("title", "")))
+    abstract = str(row.get("Abstract", row.get("abstract", "")))
+    keywords = str(row.get("Author_Keywords", row.get("author_keywords", "")))
+    article_text = f"Title: {title}\nKeywords: {keywords}\nAbstract: {abstract[:2000]}"
+    results = {"raw_responses": {}, "step_results": {}}
+
+    for prompt_file, step_name, output_key, label, desc in STEPS:
+        if step_name != "screener" and results.get("status") in ("Exclude", "Background"):
+            results["step_results"][step_name] = {"skipped": True, "reason": f"Article is {results.get('status')}"}
+            if output_key == "path":
+                results[output_key] = results.get("exclusion_code", "")
+            else:
+                results[output_key] = ""
+            continue
+
+        system_msg = load_prompt(prompt_file) + load_examples(step_name)
+        try:
+            raw = caller(article_text, system_msg, model, api_key)
+            results["raw_responses"][step_name] = raw
+            parsed = json.loads(raw)
+            results["step_results"][step_name] = parsed
+
+            if step_name == "screener":
+                results["status"] = parsed.get("status", "Exclude")
+                results["exclusion_code"] = parsed.get("exclusion_code", "")
+                results["screen_confidence"] = parsed.get("confidence", 0)
+                results["screen_reasoning"] = parsed.get("reasoning", "")
+            elif step_name == "path":
+                results["path"] = parsed.get("path", "")
+            elif step_name == "cg":
+                mechs = parsed.get("cg_mechanisms", [])
+                results["cg_mechanisms"] = ";".join(mechs) if isinstance(mechs, list) else str(mechs)
+            elif step_name == "esg":
+                outcomes = parsed.get("esg_outcomes", [])
+                results["esg_outcomes"] = ";".join(outcomes) if isinstance(outcomes, list) else str(outcomes)
+            elif step_name == "meta":
+                results["meta_potential"] = parsed.get("meta_potential", "")
+
+        except Exception as e:
+            results["raw_responses"][step_name] = f"ERROR: {str(e)}"
+            results["step_results"][step_name] = {"error": str(e)}
+            if step_name == "screener":
+                results["status"] = "ERROR"
+                results["exclusion_code"] = ""
+            else:
+                results[output_key] = "ERROR"
+
+    return results
+
+# --- Job Management ---
+JOBS = {}
+
+def run_job(job_id, df, provider_name, api_key, model):
+    job = JOBS[job_id]
+    job["status"] = "running"
+    job["total"] = len(df)
+    job["log"] = []
+    results_list = []
+
+    for i, (_, row) in enumerate(df.iterrows()):
+        job["progress"] = i
+        title_short = str(row.get("Title", row.get("title", "")))[:80]
+        job["log"].append({"i": i+1, "title": title_short, "status": "processing", "step_results": {}, "raw": {}})
+
+        try:
+            result = classify_article(row, provider_name, api_key, model, job)
+            result["_original_row"] = row.to_dict()
+            results_list.append(result)
+            job["log"][-1]["status"] = result.get("status", "?")
+            job["log"][-1]["raw"] = result.get("raw_responses", {})
+            job["log"][-1]["step_results"] = result.get("step_results", {})
+            job["log"][-1]["summary"] = {
+                "status": result.get("status", ""),
+                "path": result.get("path", ""),
+                "cg": result.get("cg_mechanisms", ""),
+                "esg": result.get("esg_outcomes", ""),
+                "meta": result.get("meta_potential", ""),
+                "confidence": result.get("screen_confidence", ""),
+                "reasoning": result.get("screen_reasoning", ""),
+            }
+        except Exception as e:
+            job["errors"] += 1
+            job["log"][-1]["status"] = f"ERROR: {e}"
+            results_list.append({"status": "ERROR", "_original_row": row.to_dict()})
+
+    out_rows = []
+    for r in results_list:
+        orig = r.get("_original_row", {})
+        out_rows.append({
+            "Title": orig.get("Title", orig.get("title", "")),
+            "Authors": orig.get("Authors", orig.get("authors", "")),
+            "Year": orig.get("Year", orig.get("year", "")),
+            "Journal": orig.get("Journal", orig.get("journal", "")),
+            "DOI": orig.get("DOI", orig.get("doi", "")),
+            "Source": orig.get("Source", orig.get("source", "")),
+            "Abstract": str(orig.get("Abstract", orig.get("abstract", "")))[:500],
+            "AI_Status": r.get("status", ""),
+            "AI_Exclusion_Code": r.get("exclusion_code", ""),
+            "AI_Path": r.get("path", ""),
+            "AI_CG_Mechanism": r.get("cg_mechanisms", ""),
+            "AI_ESG_Outcome": r.get("esg_outcomes", ""),
+            "AI_Meta_Potential": r.get("meta_potential", ""),
+            "AI_Confidence": r.get("screen_confidence", ""),
+            "AI_Reasoning": r.get("screen_reasoning", ""),
+        })
+
+    out_df = pd.DataFrame(out_rows)
+    output_path = Path(__file__).parent / "output" / f"brain_results_{job_id[:8]}.xlsx"
+    out_df.to_excel(output_path, index=False, sheet_name="AI_Results")
+    job["output_path"] = str(output_path)
+    job["progress"] = len(df)
+    job["status"] = "done"
+
+# --- Flask App ---
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return HTML_PAGE
+
+# --- Prompt CRUD ---
+@app.route("/api/prompts")
+def get_prompts():
+    result = []
+    for prompt_file, step_name, output_key, label, desc in STEPS:
+        content = load_prompt(prompt_file)
+        examples_path = EXAMPLE_DIR / f"{step_name}.jsonl"
+        examples_content = examples_path.read_text() if examples_path.exists() else ""
+        num_examples = len([l for l in examples_content.strip().split("\n") if l.strip()]) if examples_content.strip() else 0
+        result.append({
+            "file": prompt_file,
+            "step": step_name,
+            "label": label,
+            "desc": desc,
+            "content": content,
+            "examples": examples_content,
+            "num_examples": num_examples,
+        })
+    return jsonify(result)
+
+@app.route("/api/prompts/<step>", methods=["POST"])
+def save_prompt(step):
+    data = request.json
+    for prompt_file, step_name, *_ in STEPS:
+        if step_name == step:
+            if "content" in data:
+                (PROMPT_DIR / prompt_file).write_text(data["content"])
+            if "examples" in data:
+                (EXAMPLE_DIR / f"{step_name}.jsonl").write_text(data["examples"])
+            return jsonify({"ok": True})
+    return jsonify({"error": "Unknown step"}), 404
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "No file"}), 400
+    upload_dir = Path(__file__).parent / "output"
+    upload_dir.mkdir(exist_ok=True)
+    fpath = upload_dir / f"upload_{uuid.uuid4().hex[:8]}_{f.filename}"
+    f.save(fpath)
+    try:
+        if str(fpath).endswith(".csv"):
+            df = pd.read_csv(fpath)
+        else:
+            df = pd.read_excel(fpath, header=1)
+            if "Title" not in df.columns and "title" not in df.columns:
+                df = pd.read_excel(fpath, header=0)
+            if "Title" not in df.columns and "title" not in df.columns:
+                xls = pd.ExcelFile(fpath)
+                for s in xls.sheet_names:
+                    df = pd.read_excel(xls, s, header=1)
+                    if "Title" in df.columns or "title" in df.columns:
+                        break
+    except Exception as e:
+        return jsonify({"error": f"Could not read file: {e}"}), 400
+    col_map = {c: c.strip() for c in df.columns}
+    df.rename(columns=col_map, inplace=True)
+    if "Title" not in df.columns and "title" not in df.columns:
+        return jsonify({"error": f"No 'Title' column found. Columns: {list(df.columns)[:10]}"}), 400
+    title_col = "Title" if "Title" in df.columns else "title"
+    df = df[df[title_col].notna() & (df[title_col].astype(str).str.len() > 5)]
+    return jsonify({"rows": len(df), "columns": list(df.columns), "file_path": str(fpath)})
+
+@app.route("/run", methods=["POST"])
+def run():
+    data = request.json
+    fpath = data.get("file_path")
+    provider = data.get("provider", "openai")
+    api_key = data.get("api_key", "")
+    model = data.get("model", PROVIDERS[provider]["default_model"])
+    max_articles = data.get("max_articles", 0)
+    if not api_key:
+        return jsonify({"error": "API key required"}), 400
+    try:
+        if fpath.endswith(".csv"):
+            df = pd.read_csv(fpath)
+        else:
+            df = pd.read_excel(fpath, header=1)
+            if "Title" not in df.columns and "title" not in df.columns:
+                df = pd.read_excel(fpath, header=0)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    title_col = "Title" if "Title" in df.columns else "title"
+    df = df[df[title_col].notna() & (df[title_col].astype(str).str.len() > 5)]
+    if max_articles and max_articles > 0:
+        df = df.head(max_articles)
+    job_id = uuid.uuid4().hex
+    JOBS[job_id] = {"status": "queued", "progress": 0, "total": len(df), "errors": 0, "log": []}
+    thread = threading.Thread(target=run_job, args=(job_id, df, provider, api_key, model))
+    thread.start()
+    return jsonify({"job_id": job_id, "total": len(df)})
+
+@app.route("/status/<job_id>")
+def status(job_id):
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "Unknown job"}), 404
+    return jsonify({
+        "status": job["status"], "progress": job["progress"], "total": job["total"],
+        "errors": job["errors"], "log": job.get("log", []),
+        "output_path": job.get("output_path", ""),
+    })
+
+@app.route("/download/<job_id>")
+def download(job_id):
+    job = JOBS.get(job_id)
+    if not job or not job.get("output_path"):
+        return jsonify({"error": "No output"}), 404
+    return send_file(job["output_path"], as_attachment=True)
+
+# =====================================================
+# HTML UI v2
+# =====================================================
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SLR Brain v2</title>
+<style>
+:root{--bg:#0b1120;--bg2:#111827;--card:#1e293b;--border:#334155;--accent:#3b82f6;
+--green:#22c55e;--red:#ef4444;--yellow:#eab308;--orange:#f97316;--purple:#a855f7;
+--text:#e2e8f0;--muted:#94a3b8;--dim:#475569;}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;}
+a{color:var(--accent);text-decoration:none;}
+
+/* --- NAV TABS --- */
+.topbar{background:var(--bg2);border-bottom:1px solid var(--border);padding:0 2rem;display:flex;align-items:center;gap:2rem;position:sticky;top:0;z-index:100;}
+.topbar h1{font-size:1.1rem;padding:0.9rem 0;white-space:nowrap;}
+.topbar .tabs{display:flex;gap:0;}
+.topbar .tab{padding:0.9rem 1.25rem;font-size:0.85rem;font-weight:500;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;transition:all 0.15s;}
+.topbar .tab:hover{color:var(--text);}
+.topbar .tab.active{color:var(--accent);border-bottom-color:var(--accent);}
+.page{display:none;padding:1.5rem 2rem;max-width:1400px;margin:0 auto;}
+.page.active{display:block;}
+
+/* --- CARDS --- */
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:1.25rem;}
+.card h2{font-size:0.8rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.75rem;}
+
+/* --- FORMS --- */
+label{display:block;font-size:0.78rem;color:var(--muted);margin-bottom:0.2rem;margin-top:0.6rem;}
+select,input[type=text],input[type=password],input[type=number]{
+  width:100%;padding:0.45rem 0.65rem;background:var(--bg);border:1px solid var(--border);
+  border-radius:6px;color:var(--text);font-size:0.85rem;}
+select:focus,input:focus,textarea:focus{outline:none;border-color:var(--accent);}
+textarea{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;
+  color:var(--text);font-family:'JetBrains Mono','Fira Code',monospace;font-size:0.78rem;
+  padding:0.75rem;line-height:1.5;resize:vertical;}
+
+/* --- BUTTONS --- */
+.btn{padding:0.5rem 1.2rem;border:none;border-radius:7px;font-weight:600;cursor:pointer;font-size:0.82rem;transition:all 0.12s;}
+.btn-primary{background:var(--accent);color:white;}
+.btn-primary:hover{background:#2563eb;}
+.btn-primary:disabled{opacity:0.35;cursor:not-allowed;}
+.btn-sm{padding:0.35rem 0.8rem;font-size:0.75rem;border-radius:5px;}
+.btn-ghost{background:transparent;border:1px solid var(--border);color:var(--muted);}
+.btn-ghost:hover{border-color:var(--accent);color:var(--text);}
+.btn-green{background:var(--green);color:white;}
+.btn-green:hover{background:#16a34a;}
+.btn-row{display:flex;gap:0.5rem;align-items:center;margin-top:0.75rem;}
+
+/* --- DROPZONE --- */
+.dropzone{border:2px dashed var(--border);border-radius:10px;padding:2rem;text-align:center;cursor:pointer;transition:all 0.2s;}
+.dropzone:hover,.dropzone.active{border-color:var(--accent);background:rgba(59,130,246,0.04);}
+.dropzone .icon{font-size:2rem;margin-bottom:0.3rem;}
+.dropzone p{color:var(--muted);font-size:0.82rem;}
+#file-input{display:none;}
+.file-info{margin-top:0.75rem;padding:0.6rem;background:rgba(59,130,246,0.08);border-radius:7px;font-size:0.82rem;}
+
+/* --- PROMPT EDITOR --- */
+.step-grid{display:grid;grid-template-columns:200px 1fr;gap:0;min-height:70vh;}
+.step-nav{border-right:1px solid var(--border);padding:0.5rem 0;}
+.step-nav-item{padding:0.65rem 1rem;cursor:pointer;font-size:0.82rem;display:flex;align-items:center;gap:0.6rem;
+  color:var(--muted);transition:all 0.12s;border-left:3px solid transparent;}
+.step-nav-item:hover{background:rgba(59,130,246,0.05);color:var(--text);}
+.step-nav-item.active{background:rgba(59,130,246,0.08);color:var(--accent);border-left-color:var(--accent);}
+.step-nav-item .num{width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  font-size:0.7rem;font-weight:700;background:var(--border);color:var(--text);}
+.step-nav-item.active .num{background:var(--accent);color:white;}
+.step-editor{padding:1.25rem 1.5rem;}
+.step-editor .step-title{font-size:1rem;font-weight:600;margin-bottom:0.15rem;}
+.step-editor .step-desc{color:var(--muted);font-size:0.8rem;margin-bottom:1rem;}
+.saved-toast{display:inline-block;color:var(--green);font-size:0.78rem;margin-left:0.75rem;opacity:0;transition:opacity 0.3s;}
+.saved-toast.show{opacity:1;}
+.example-count{font-size:0.72rem;color:var(--dim);margin-left:auto;}
+
+/* --- PROGRESS / STATS --- */
+.stats-row{display:flex;gap:1.2rem;margin-bottom:0.75rem;}
+.stat-box{text-align:center;}
+.stat-box .num{font-size:1.3rem;font-weight:700;}
+.stat-box .label{font-size:0.7rem;color:var(--muted);}
+.progress-bar{width:100%;height:6px;background:var(--bg);border-radius:3px;overflow:hidden;margin:0.5rem 0;}
+.progress-fill{height:100%;background:var(--accent);border-radius:3px;transition:width 0.3s;width:0%;}
+
+/* --- RESULTS TABLE --- */
+.results-wrap{overflow-x:auto;margin-top:1rem;}
+table.results{width:100%;border-collapse:collapse;font-size:0.75rem;}
+table.results th{background:var(--bg2);color:var(--muted);font-weight:600;text-transform:uppercase;
+  letter-spacing:0.04em;padding:0.5rem 0.6rem;text-align:left;position:sticky;top:0;white-space:nowrap;font-size:0.7rem;}
+table.results td{padding:0.45rem 0.6rem;border-bottom:1px solid rgba(51,65,85,0.3);vertical-align:top;max-width:200px;overflow:hidden;text-overflow:ellipsis;}
+table.results tr:hover td{background:rgba(59,130,246,0.04);}
+table.results .expand-btn{color:var(--accent);cursor:pointer;font-size:0.7rem;white-space:nowrap;}
+
+/* Badges */
+.badge{padding:0.15rem 0.5rem;border-radius:4px;font-size:0.7rem;font-weight:600;white-space:nowrap;display:inline-block;}
+.b-include{background:rgba(34,197,94,0.15);color:var(--green);}
+.b-exclude{background:rgba(239,68,68,0.15);color:var(--red);}
+.b-background{background:rgba(234,179,8,0.15);color:var(--yellow);}
+.b-error{background:rgba(239,68,68,0.3);color:var(--red);}
+.b-processing{background:rgba(59,130,246,0.15);color:var(--accent);}
+.b-high{background:rgba(34,197,94,0.15);color:var(--green);}
+.b-medium{background:rgba(234,179,8,0.15);color:var(--yellow);}
+.b-low{background:rgba(148,163,184,0.15);color:var(--muted);}
+
+/* Raw detail row */
+.detail-row td{background:var(--bg2) !important;padding:0 !important;}
+.detail-inner{padding:0.75rem 1rem;display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:0.75rem;}
+.detail-box{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:0.6rem;font-size:0.72rem;}
+.detail-box h4{color:var(--accent);font-size:0.72rem;margin-bottom:0.3rem;text-transform:uppercase;letter-spacing:0.04em;}
+.detail-box pre{white-space:pre-wrap;word-break:break-word;color:var(--muted);line-height:1.4;margin:0;}
+
+.download-bar{margin-top:1rem;padding:0.75rem 1rem;background:rgba(34,197,94,0.08);border:1px solid rgba(34,197,94,0.2);
+  border-radius:8px;display:none;align-items:center;justify-content:space-between;}
+.download-bar.show{display:flex;}
+
+.two-col{display:grid;grid-template-columns:340px 1fr;gap:1.25rem;}
+@media(max-width:900px){.two-col{grid-template-columns:1fr;}.step-grid{grid-template-columns:1fr;}}
+</style>
+</head>
+<body>
+
+<!-- TOP NAV -->
+<div class="topbar">
+  <h1>SLR Brain</h1>
+  <div class="tabs">
+    <div class="tab active" onclick="showPage('run')">Run Pipeline</div>
+    <div class="tab" onclick="showPage('prompts')">Prompt Editor</div>
+    <div class="tab" onclick="showPage('results')">Results Table</div>
+  </div>
+</div>
+
+<!-- ============== PAGE 1: RUN ============== -->
+<div class="page active" id="page-run">
+<div class="two-col">
+  <div>
+    <div class="card">
+      <h2>Upload Articles</h2>
+      <div class="dropzone" id="dropzone" onclick="document.getElementById('file-input').click()">
+        <div class="icon">+</div>
+        <p>Drop Excel / CSV here</p>
+      </div>
+      <input type="file" id="file-input" accept=".xlsx,.xls,.csv">
+      <div class="file-info" id="file-info" style="display:none;"></div>
+    </div>
+    <div class="card" style="margin-top:1rem;">
+      <h2>Configure</h2>
+      <label>Provider</label>
+      <select id="provider" onchange="updateModelDefault()">
+        <option value="openai">OpenAI</option>
+        <option value="anthropic">Anthropic (Claude)</option>
+      </select>
+      <label>Model</label>
+      <input type="text" id="model" value="gpt-4o-mini">
+      <label>API Key</label>
+      <input type="password" id="api-key" placeholder="sk-...">
+      <label>Max articles (0 = all)</label>
+      <input type="number" id="max-articles" value="5" min="0">
+      <div class="btn-row">
+        <button class="btn btn-primary" id="run-btn" onclick="startRun()" disabled>Run Brain</button>
+        <button class="btn btn-ghost" onclick="location.reload()">Reset</button>
+      </div>
+    </div>
+  </div>
+  <div>
+    <div class="card">
+      <h2>Progress</h2>
+      <div class="stats-row">
+        <div class="stat-box"><div class="num" id="s-done">0</div><div class="label">Done</div></div>
+        <div class="stat-box"><div class="num" id="s-total">0</div><div class="label">Total</div></div>
+        <div class="stat-box"><div class="num" style="color:var(--green)" id="s-inc">0</div><div class="label">Include</div></div>
+        <div class="stat-box"><div class="num" style="color:var(--red)" id="s-exc">0</div><div class="label">Exclude</div></div>
+        <div class="stat-box"><div class="num" style="color:var(--red)" id="s-err">0</div><div class="label">Errors</div></div>
+      </div>
+      <div class="progress-bar"><div class="progress-fill" id="pbar"></div></div>
+      <div class="download-bar" id="download-bar">
+        <span style="color:var(--green);font-weight:600;">Done!</span>
+        <button class="btn btn-green btn-sm" onclick="downloadResult()">Download .xlsx</button>
+        <button class="btn btn-ghost btn-sm" onclick="showPage('results')">View Table</button>
+      </div>
+    </div>
+    <div class="card" style="margin-top:1rem;">
+      <h2>Live Feed</h2>
+      <div id="live-feed" style="max-height:50vh;overflow-y:auto;font-size:0.78rem;font-family:monospace;">
+        <div style="color:var(--dim);padding:1rem;text-align:center;">Upload a file and click Run</div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ============== PAGE 2: PROMPT EDITOR ============== -->
+<div class="page" id="page-prompts">
+<div class="card" style="padding:0;overflow:hidden;">
+  <div class="step-grid">
+    <div class="step-nav" id="step-nav"></div>
+    <div class="step-editor" id="step-editor">
+      <div style="color:var(--dim);padding:2rem;text-align:center;">Loading prompts...</div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ============== PAGE 3: RESULTS TABLE ============== -->
+<div class="page" id="page-results">
+<div class="card">
+  <h2>Intermediate Results <span style="font-weight:400;text-transform:none;letter-spacing:0;" id="result-count"></span></h2>
+  <div class="results-wrap">
+    <table class="results" id="results-table">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Title</th>
+          <th>Step 1: Screen</th>
+          <th>Step 2: Path</th>
+          <th>Step 3: CG Tags</th>
+          <th>Step 4: ESG Tags</th>
+          <th>Step 5: Meta</th>
+          <th>Confidence</th>
+          <th>Detail</th>
+        </tr>
+      </thead>
+      <tbody id="results-body">
+        <tr><td colspan="9" style="text-align:center;color:var(--dim);padding:2rem;">Run the pipeline first</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+</div>
+
+<script>
+// --- State ---
+let filePath=null, jobId=null, pollInterval=null;
+let allPrompts=[], activeStep=0, allLogs=[];
+
+// --- Page Nav ---
+function showPage(id){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.getElementById('page-'+id).classList.add('active');
+  document.querySelector(`.tab[onclick="showPage('${id}')"]`).classList.add('active');
+  if(id==='prompts'&&allPrompts.length===0) loadPrompts();
+  if(id==='results') renderResultsTable();
+}
+
+// --- Upload ---
+const dz=document.getElementById('dropzone'), fi=document.getElementById('file-input');
+['dragenter','dragover'].forEach(e=>dz.addEventListener(e,ev=>{ev.preventDefault();dz.classList.add('active');}));
+['dragleave','drop'].forEach(e=>dz.addEventListener(e,ev=>{ev.preventDefault();dz.classList.remove('active');}));
+dz.addEventListener('drop',ev=>{if(ev.dataTransfer.files.length)uploadFile(ev.dataTransfer.files[0]);});
+fi.addEventListener('change',ev=>{if(ev.target.files.length)uploadFile(ev.target.files[0]);});
+
+function uploadFile(file){
+  const fd=new FormData(); fd.append('file',file);
+  document.getElementById('file-info').style.display='block';
+  document.getElementById('file-info').innerHTML='Uploading...';
+  fetch('/upload',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{
+    if(d.error){document.getElementById('file-info').innerHTML='<span style="color:var(--red)">'+d.error+'</span>';return;}
+    filePath=d.file_path;
+    document.getElementById('file-info').innerHTML='<strong>'+file.name+'</strong> — '+d.rows+' articles';
+    document.getElementById('run-btn').disabled=false;
+    document.getElementById('s-total').textContent=d.rows;
+  });
+}
+
+function updateModelDefault(){
+  document.getElementById('model').value=document.getElementById('provider').value==='openai'?'gpt-4o-mini':'claude-sonnet-4-20250514';
+}
+
+// --- Run ---
+function startRun(){
+  const key=document.getElementById('api-key').value;
+  if(!key){alert('Enter API key');return;} if(!filePath){alert('Upload file first');return;}
+  document.getElementById('run-btn').disabled=true;
+  document.getElementById('live-feed').innerHTML='';
+  allLogs=[];
+  fetch('/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+    file_path:filePath, provider:document.getElementById('provider').value,
+    api_key:key, model:document.getElementById('model').value,
+    max_articles:parseInt(document.getElementById('max-articles').value)||0
+  })}).then(r=>r.json()).then(d=>{
+    if(d.error){alert(d.error);document.getElementById('run-btn').disabled=false;return;}
+    jobId=d.job_id; document.getElementById('s-total').textContent=d.total;
+    pollInterval=setInterval(pollStatus,1200);
+  });
+}
+
+function pollStatus(){
+  if(!jobId)return;
+  fetch('/status/'+jobId).then(r=>r.json()).then(d=>{
+    document.getElementById('s-done').textContent=d.progress;
+    document.getElementById('s-err').textContent=d.errors;
+    document.getElementById('pbar').style.width=(d.total>0?(d.progress/d.total*100):0)+'%';
+    allLogs=d.log||[];
+    let inc=0,exc=0;
+    allLogs.forEach(l=>{if(l.status==='Include')inc++;if(l.status==='Exclude')exc++;});
+    document.getElementById('s-inc').textContent=inc;
+    document.getElementById('s-exc').textContent=exc;
+    renderLiveFeed(allLogs.slice(-30));
+    if(d.status==='done'){
+      clearInterval(pollInterval);
+      document.getElementById('download-bar').classList.add('show');
+      document.getElementById('run-btn').disabled=false;
+    }
+  });
+}
+
+function renderLiveFeed(logs){
+  const el=document.getElementById('live-feed');
+  el.innerHTML=logs.map(l=>{
+    const bc=l.status==='Include'?'b-include':l.status==='Exclude'?'b-exclude':
+             l.status==='Background'?'b-background':l.status?.startsWith('ERROR')?'b-error':'b-processing';
+    const s=l.summary||{};
+    let extra='';
+    if(s.path) extra+=` <span style="color:var(--dim)">${s.path.replace('Path_A_CG_to_ESG','A').replace('Both_A_and_B','A+B').replace('Path_B_ESG_to_FP_with_CG_moderation','B')}</span>`;
+    if(s.meta) extra+=` <span class="badge b-${s.meta.toLowerCase()}">${s.meta}</span>`;
+    return `<div style="padding:0.3rem 0;border-bottom:1px solid rgba(51,65,85,0.3);display:flex;gap:0.5rem;align-items:center;">
+      <span style="color:var(--dim);min-width:1.5rem;text-align:right;">${l.i}</span>
+      <span class="badge ${bc}">${l.status}</span>${extra}
+      <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${l.title||''}</span>
+    </div>`;
+  }).join('');
+  el.scrollTop=el.scrollHeight;
+}
+
+function downloadResult(){if(jobId)window.location.href='/download/'+jobId;}
+
+// --- Prompt Editor ---
+function loadPrompts(){
+  fetch('/api/prompts').then(r=>r.json()).then(data=>{
+    allPrompts=data;
+    renderStepNav();
+    selectStep(0);
+  });
+}
+
+function renderStepNav(){
+  const nav=document.getElementById('step-nav');
+  nav.innerHTML=allPrompts.map((p,i)=>`
+    <div class="step-nav-item ${i===activeStep?'active':''}" onclick="selectStep(${i})">
+      <span class="num">${i+1}</span>
+      <span>${p.label}</span>
+      <span class="example-count">${p.num_examples} ex</span>
+    </div>`).join('');
+}
+
+function selectStep(i){
+  activeStep=i;
+  renderStepNav();
+  const p=allPrompts[i];
+  const ed=document.getElementById('step-editor');
+  ed.innerHTML=`
+    <div class="step-title">${p.label}</div>
+    <div class="step-desc">${p.desc} &nbsp;—&nbsp; <code>${p.file}</code></div>
+
+    <label>Prompt Logic <span style="color:var(--dim)">(Markdown — edit freely)</span></label>
+    <textarea id="prompt-content" rows="18">${escHtml(p.content)}</textarea>
+
+    <label style="margin-top:1rem;">Few-Shot Examples <span style="color:var(--dim)">(JSONL — one JSON object per line)</span></label>
+    <textarea id="prompt-examples" rows="8" placeholder='{"title":"...","abstract":"...","expected":{...}}'>${escHtml(p.examples)}</textarea>
+
+    <div class="btn-row">
+      <button class="btn btn-primary btn-sm" onclick="saveStep(${i})">Save Changes</button>
+      <button class="btn btn-ghost btn-sm" onclick="selectStep(${i})">Revert</button>
+      <span class="saved-toast" id="save-toast">Saved!</span>
+    </div>
+  `;
+}
+
+function saveStep(i){
+  const p=allPrompts[i];
+  const content=document.getElementById('prompt-content').value;
+  const examples=document.getElementById('prompt-examples').value;
+  fetch('/api/prompts/'+p.step,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({content,examples})
+  }).then(r=>r.json()).then(d=>{
+    if(d.ok){
+      allPrompts[i].content=content;
+      allPrompts[i].examples=examples;
+      allPrompts[i].num_examples=examples.trim()?examples.trim().split('\n').filter(l=>l.trim()).length:0;
+      renderStepNav();
+      const t=document.getElementById('save-toast');
+      t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2000);
+    }
+  });
+}
+
+// --- Results Table ---
+function renderResultsTable(){
+  const body=document.getElementById('results-body');
+  if(!allLogs.length){body.innerHTML='<tr><td colspan="9" style="text-align:center;color:var(--dim);padding:2rem;">No results yet. Run the pipeline first.</td></tr>';return;}
+  document.getElementById('result-count').textContent=`(${allLogs.length} articles)`;
+  body.innerHTML=allLogs.map((l,idx)=>{
+    const s=l.summary||{};
+    const bc=s.status==='Include'?'b-include':s.status==='Exclude'?'b-exclude':
+             s.status==='Background'?'b-background':'b-error';
+    const mc=s.meta==='High'?'b-high':s.meta==='Medium'?'b-medium':'b-low';
+    const pathShort=(s.path||'').replace('Path_A_CG_to_ESG','Path A').replace('Both_A_and_B','Both A+B').replace('Path_B_ESG_to_FP_with_CG_moderation','Path B');
+    const cgShort=(s.cg||'').replace(/;/g,'; ').replace(/_/g,' ');
+    const esgShort=(s.esg||'').replace(/;/g,'; ').replace(/_/g,' ');
+    const conf=typeof s.confidence==='number'?(s.confidence*100).toFixed(0)+'%':'';
+
+    return `<tr>
+      <td>${l.i}</td>
+      <td title="${escAttr(l.title)}" style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${l.title||''}</td>
+      <td><span class="badge ${bc}">${s.status||'?'}</span></td>
+      <td>${pathShort||'—'}</td>
+      <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;" title="${escAttr(cgShort)}">${cgShort||'—'}</td>
+      <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;" title="${escAttr(esgShort)}">${esgShort||'—'}</td>
+      <td><span class="badge ${mc}">${s.meta||'—'}</span></td>
+      <td>${conf}</td>
+      <td><span class="expand-btn" onclick="toggleDetail(${idx})">show</span></td>
+    </tr>
+    <tr class="detail-row" id="detail-${idx}" style="display:none;">
+      <td colspan="9">
+        <div class="detail-inner">
+          ${Object.entries(l.step_results||{}).map(([k,v])=>`
+            <div class="detail-box">
+              <h4>${k}</h4>
+              <pre>${typeof v==='object'?JSON.stringify(v,null,2):v}</pre>
+            </div>`).join('')}
+          ${s.reasoning?`<div class="detail-box"><h4>Reasoning</h4><pre>${s.reasoning}</pre></div>`:''}
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function toggleDetail(idx){
+  const row=document.getElementById('detail-'+idx);
+  row.style.display=row.style.display==='none'?'table-row':'none';
+}
+
+// --- Util ---
+function escHtml(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function escAttr(s){return (s||'').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+</script>
+</body>
+</html>"""
+
+if __name__ == "__main__":
+    print("\n  SLR Brain v2 — http://localhost:8080\n")
+    app.run(host="0.0.0.0", port=8080, debug=False)

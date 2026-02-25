@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+output/upload_*
+output/brain_results_*
+.DS_Store
+*.env
