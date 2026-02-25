@@ -1,8 +1,8 @@
 """
-SLR Brain v2 — Web UI with Prompt Editor + Intermediate Results Table
+SLR Brain v2 — Web UI with Pipeline Visualization + Prompt Editor + Eval
 """
 
-import os, json, time, uuid, threading
+import os, json, time, uuid, threading, re
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file
 import pandas as pd
@@ -26,6 +26,41 @@ def call_anthropic(prompt, system_msg, model, api_key, temperature=0.2):
         system=system_msg, messages=[{"role": "user", "content": prompt}]
     )
     return resp.content[0].text
+
+def extract_json(text):
+    """Extract JSON from text that might contain markdown code blocks or extra text."""
+    text = text.strip()
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Try extracting from code block
+    match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+    # Try finding first { ... } block
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+    raise json.JSONDecodeError("No valid JSON found in response", text, 0)
+
+def call_with_retry(caller, prompt, system_msg, model, api_key, max_retries=3):
+    """Call AI provider with exponential backoff retry."""
+    for attempt in range(max_retries):
+        try:
+            return caller(prompt, system_msg, model, api_key)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            wait = 2 ** (attempt + 1)
+            time.sleep(wait)
 
 PROVIDERS = {
     "openai": {"caller": call_openai, "default_model": "gpt-4o-mini"},
@@ -55,16 +90,85 @@ def load_examples(step_name):
         parts.append(f"Expected output: {json.dumps(ex.get('expected', {}))}\n")
     return "\n".join(parts)
 
+# --- Deduplication ---
+def deduplicate_df(df):
+    """Remove duplicate articles by DOI and normalized title. Returns (clean_df, dup_count, dup_details)."""
+    title_col = "Title" if "Title" in df.columns else "title"
+    original_count = len(df)
+    dup_details = []
+
+    # Phase 1: Exact DOI dedup
+    doi_col = None
+    for c in df.columns:
+        if c.lower() == "doi":
+            doi_col = c
+            break
+    if doi_col and df[doi_col].notna().any():
+        doi_mask = df[doi_col].notna() & (df[doi_col].astype(str).str.strip() != "")
+        doi_rows = df[doi_mask]
+        doi_dupes = doi_rows[doi_rows[doi_col].astype(str).str.strip().str.lower().duplicated(keep="first")]
+        for _, row in doi_dupes.iterrows():
+            dup_details.append({"title": str(row[title_col])[:80], "reason": f"Duplicate DOI: {row[doi_col]}"})
+        df = df.drop(doi_dupes.index)
+
+    # Phase 2: Normalized title dedup
+    def normalize_title(t):
+        t = str(t).lower().strip()
+        t = re.sub(r'[^a-z0-9\s]', '', t)
+        t = re.sub(r'\s+', ' ', t).strip()
+        return t
+
+    df = df.copy()
+    df["_norm_title"] = df[title_col].apply(normalize_title)
+    title_dupes = df[df["_norm_title"].duplicated(keep="first")]
+    for _, row in title_dupes.iterrows():
+        dup_details.append({"title": str(row[title_col])[:80], "reason": "Duplicate title"})
+    df = df.drop(title_dupes.index)
+    df = df.drop(columns=["_norm_title"])
+
+    dup_count = original_count - len(df)
+    return df.reset_index(drop=True), dup_count, dup_details
+
+# --- File Parsing (shared logic) ---
+def parse_uploaded_file(fpath):
+    """Parse uploaded Excel/CSV file. Returns (df, error_string)."""
+    fpath = str(fpath)
+    try:
+        if fpath.endswith(".csv"):
+            df = pd.read_csv(fpath)
+        else:
+            df = pd.read_excel(fpath, header=1)
+            if "Title" not in df.columns and "title" not in df.columns:
+                df = pd.read_excel(fpath, header=0)
+            if "Title" not in df.columns and "title" not in df.columns:
+                xls = pd.ExcelFile(fpath)
+                for s in xls.sheet_names:
+                    df = pd.read_excel(xls, s, header=1)
+                    if "Title" in df.columns or "title" in df.columns:
+                        break
+    except Exception as e:
+        return None, f"Could not read file: {e}"
+
+    col_map = {c: c.strip() for c in df.columns}
+    df.rename(columns=col_map, inplace=True)
+
+    if "Title" not in df.columns and "title" not in df.columns:
+        return None, f"No 'Title' column found. Columns: {list(df.columns)[:10]}"
+
+    title_col = "Title" if "Title" in df.columns else "title"
+    df = df[df[title_col].notna() & (df[title_col].astype(str).str.len() > 5)]
+    return df, None
+
 # --- Classification Pipeline ---
 STEPS = [
     ("01_screener.md",       "screener",  "status",         "Screen",    "Include / Exclude / Background"),
-    ("02_path_classifier.md","path",      "path",           "Path",      "CG→ESG / Both / ESG→FP"),
+    ("02_path_classifier.md","path",      "path",           "Path",      "CG->ESG / Both / ESG->FP"),
     ("03_cg_tagger.md",      "cg",        "cg_mechanisms",  "CG Tags",   "Board, Ownership, etc."),
     ("04_esg_tagger.md",     "esg",       "esg_outcomes",   "ESG Tags",  "Disclosure, Rating, Pillars"),
     ("05_meta_scorer.md",    "meta",      "meta_potential",  "Meta Score","High / Medium / Low"),
 ]
 
-def classify_article(row, provider_name, api_key, model, job):
+def classify_article(row, provider_name, api_key, model, log_entry=None):
     provider = PROVIDERS[provider_name]
     caller = provider["caller"]
     title = str(row.get("Title", row.get("title", "")))
@@ -74,6 +178,10 @@ def classify_article(row, provider_name, api_key, model, job):
     results = {"raw_responses": {}, "step_results": {}}
 
     for prompt_file, step_name, output_key, label, desc in STEPS:
+        # Update live step indicator
+        if log_entry is not None:
+            log_entry["current_step"] = step_name
+
         if step_name != "screener" and results.get("status") in ("Exclude", "Background"):
             results["step_results"][step_name] = {"skipped": True, "reason": f"Article is {results.get('status')}"}
             if output_key == "path":
@@ -84,9 +192,9 @@ def classify_article(row, provider_name, api_key, model, job):
 
         system_msg = load_prompt(prompt_file) + load_examples(step_name)
         try:
-            raw = caller(article_text, system_msg, model, api_key)
+            raw = call_with_retry(caller, article_text, system_msg, model, api_key)
             results["raw_responses"][step_name] = raw
-            parsed = json.loads(raw)
+            parsed = extract_json(raw)
             results["step_results"][step_name] = parsed
 
             if step_name == "screener":
@@ -96,14 +204,18 @@ def classify_article(row, provider_name, api_key, model, job):
                 results["screen_reasoning"] = parsed.get("reasoning", "")
             elif step_name == "path":
                 results["path"] = parsed.get("path", "")
+                results["path_confidence"] = parsed.get("confidence", 0)
             elif step_name == "cg":
                 mechs = parsed.get("cg_mechanisms", [])
                 results["cg_mechanisms"] = ";".join(mechs) if isinstance(mechs, list) else str(mechs)
+                results["cg_confidence"] = parsed.get("confidence", 0)
             elif step_name == "esg":
                 outcomes = parsed.get("esg_outcomes", [])
                 results["esg_outcomes"] = ";".join(outcomes) if isinstance(outcomes, list) else str(outcomes)
+                results["esg_confidence"] = parsed.get("confidence", 0)
             elif step_name == "meta":
                 results["meta_potential"] = parsed.get("meta_potential", "")
+                results["meta_confidence"] = parsed.get("confidence", 0)
 
         except Exception as e:
             results["raw_responses"][step_name] = f"ERROR: {str(e)}"
@@ -114,6 +226,8 @@ def classify_article(row, provider_name, api_key, model, job):
             else:
                 results[output_key] = "ERROR"
 
+    if log_entry is not None:
+        log_entry["current_step"] = "done"
     return results
 
 # --- Job Management ---
@@ -121,7 +235,14 @@ JOBS = {}
 
 def run_job(job_id, df, provider_name, api_key, model):
     job = JOBS[job_id]
-    job["status"] = "running"
+    job["status"] = "dedup"
+
+    # Step 0: Deduplication
+    clean_df, dup_count, dup_details = deduplicate_df(df)
+    job["dedup"] = {"removed": dup_count, "kept": len(clean_df), "details": dup_details}
+    df = clean_df
+
+    job["status"] = "screening"
     job["total"] = len(df)
     job["log"] = []
     results_list = []
@@ -129,17 +250,20 @@ def run_job(job_id, df, provider_name, api_key, model):
     for i, (_, row) in enumerate(df.iterrows()):
         job["progress"] = i
         title_short = str(row.get("Title", row.get("title", "")))[:80]
-        job["log"].append({"i": i+1, "title": title_short, "status": "processing", "step_results": {}, "raw": {}})
+        log_entry = {"i": i+1, "title": title_short, "status": "processing", "current_step": "screener",
+                     "step_results": {}, "raw": {}}
+        job["log"].append(log_entry)
 
         try:
-            result = classify_article(row, provider_name, api_key, model, job)
+            result = classify_article(row, provider_name, api_key, model, log_entry)
             result["_original_row"] = row.to_dict()
             results_list.append(result)
-            job["log"][-1]["status"] = result.get("status", "?")
-            job["log"][-1]["raw"] = result.get("raw_responses", {})
-            job["log"][-1]["step_results"] = result.get("step_results", {})
-            job["log"][-1]["summary"] = {
+            log_entry["status"] = result.get("status", "?")
+            log_entry["raw"] = result.get("raw_responses", {})
+            log_entry["step_results"] = result.get("step_results", {})
+            log_entry["summary"] = {
                 "status": result.get("status", ""),
+                "exclusion_code": result.get("exclusion_code", ""),
                 "path": result.get("path", ""),
                 "cg": result.get("cg_mechanisms", ""),
                 "esg": result.get("esg_outcomes", ""),
@@ -149,9 +273,11 @@ def run_job(job_id, df, provider_name, api_key, model):
             }
         except Exception as e:
             job["errors"] += 1
-            job["log"][-1]["status"] = f"ERROR: {e}"
+            log_entry["status"] = f"ERROR: {e}"
+            log_entry["current_step"] = "error"
             results_list.append({"status": "ERROR", "_original_row": row.to_dict()})
 
+    # Build output Excel
     out_rows = []
     for r in results_list:
         orig = r.get("_original_row", {})
@@ -228,27 +354,9 @@ def upload():
     upload_dir.mkdir(exist_ok=True)
     fpath = upload_dir / f"upload_{uuid.uuid4().hex[:8]}_{f.filename}"
     f.save(fpath)
-    try:
-        if str(fpath).endswith(".csv"):
-            df = pd.read_csv(fpath)
-        else:
-            df = pd.read_excel(fpath, header=1)
-            if "Title" not in df.columns and "title" not in df.columns:
-                df = pd.read_excel(fpath, header=0)
-            if "Title" not in df.columns and "title" not in df.columns:
-                xls = pd.ExcelFile(fpath)
-                for s in xls.sheet_names:
-                    df = pd.read_excel(xls, s, header=1)
-                    if "Title" in df.columns or "title" in df.columns:
-                        break
-    except Exception as e:
-        return jsonify({"error": f"Could not read file: {e}"}), 400
-    col_map = {c: c.strip() for c in df.columns}
-    df.rename(columns=col_map, inplace=True)
-    if "Title" not in df.columns and "title" not in df.columns:
-        return jsonify({"error": f"No 'Title' column found. Columns: {list(df.columns)[:10]}"}), 400
-    title_col = "Title" if "Title" in df.columns else "title"
-    df = df[df[title_col].notna() & (df[title_col].astype(str).str.len() > 5)]
+    df, err = parse_uploaded_file(fpath)
+    if err:
+        return jsonify({"error": err}), 400
     return jsonify({"rows": len(df), "columns": list(df.columns), "file_path": str(fpath)})
 
 @app.route("/run", methods=["POST"])
@@ -261,21 +369,13 @@ def run():
     max_articles = data.get("max_articles", 0)
     if not api_key:
         return jsonify({"error": "API key required"}), 400
-    try:
-        if fpath.endswith(".csv"):
-            df = pd.read_csv(fpath)
-        else:
-            df = pd.read_excel(fpath, header=1)
-            if "Title" not in df.columns and "title" not in df.columns:
-                df = pd.read_excel(fpath, header=0)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-    title_col = "Title" if "Title" in df.columns else "title"
-    df = df[df[title_col].notna() & (df[title_col].astype(str).str.len() > 5)]
+    df, err = parse_uploaded_file(fpath)
+    if err:
+        return jsonify({"error": err}), 400
     if max_articles and max_articles > 0:
         df = df.head(max_articles)
     job_id = uuid.uuid4().hex
-    JOBS[job_id] = {"status": "queued", "progress": 0, "total": len(df), "errors": 0, "log": []}
+    JOBS[job_id] = {"status": "queued", "progress": 0, "total": len(df), "errors": 0, "log": [], "dedup": None}
     thread = threading.Thread(target=run_job, args=(job_id, df, provider, api_key, model))
     thread.start()
     return jsonify({"job_id": job_id, "total": len(df)})
@@ -289,6 +389,7 @@ def status(job_id):
         "status": job["status"], "progress": job["progress"], "total": job["total"],
         "errors": job["errors"], "log": job.get("log", []),
         "output_path": job.get("output_path", ""),
+        "dedup": job.get("dedup"),
     })
 
 @app.route("/download/<job_id>")
@@ -299,7 +400,7 @@ def download(job_id):
     return send_file(job["output_path"], as_attachment=True)
 
 # =====================================================
-# HTML UI v2
+# HTML UI v3 — Pipeline Visualization
 # =====================================================
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -376,13 +477,39 @@ textarea{width:100%;background:var(--bg);border:1px solid var(--border);border-r
 .saved-toast.show{opacity:1;}
 .example-count{font-size:0.72rem;color:var(--dim);margin-left:auto;}
 
+/* --- PIPELINE TRACKER --- */
+.pipeline-tracker{display:flex;align-items:center;gap:0;margin-bottom:1.25rem;padding:0.75rem 1rem;
+  background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow-x:auto;}
+.pipe-step{display:flex;align-items:center;gap:0.5rem;padding:0.4rem 0.8rem;border-radius:6px;font-size:0.75rem;
+  font-weight:600;white-space:nowrap;transition:all 0.3s;}
+.pipe-step .pipe-num{width:20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  font-size:0.65rem;font-weight:700;background:var(--border);color:var(--muted);}
+.pipe-step .pipe-label{color:var(--muted);}
+.pipe-step .pipe-count{font-size:0.7rem;color:var(--dim);margin-left:0.25rem;}
+.pipe-arrow{color:var(--dim);font-size:0.75rem;margin:0 0.15rem;flex-shrink:0;}
+
+.pipe-step.active{background:rgba(59,130,246,0.12);}
+.pipe-step.active .pipe-num{background:var(--accent);color:white;}
+.pipe-step.active .pipe-label{color:var(--accent);}
+
+.pipe-step.done{background:rgba(34,197,94,0.08);}
+.pipe-step.done .pipe-num{background:var(--green);color:white;}
+.pipe-step.done .pipe-label{color:var(--green);}
+
 /* --- PROGRESS / STATS --- */
-.stats-row{display:flex;gap:1.2rem;margin-bottom:0.75rem;}
-.stat-box{text-align:center;}
+.stats-row{display:flex;gap:1.2rem;margin-bottom:0.75rem;flex-wrap:wrap;}
+.stat-box{text-align:center;min-width:55px;}
 .stat-box .num{font-size:1.3rem;font-weight:700;}
 .stat-box .label{font-size:0.7rem;color:var(--muted);}
 .progress-bar{width:100%;height:6px;background:var(--bg);border-radius:3px;overflow:hidden;margin:0.5rem 0;}
 .progress-fill{height:100%;background:var(--accent);border-radius:3px;transition:width 0.3s;width:0%;}
+
+/* --- DEDUP BANNER --- */
+.dedup-banner{padding:0.6rem 1rem;border-radius:8px;font-size:0.82rem;margin-bottom:0.75rem;display:none;
+  align-items:center;gap:0.75rem;border:1px solid;}
+.dedup-banner.show{display:flex;}
+.dedup-banner.has-dups{background:rgba(234,179,8,0.08);border-color:rgba(234,179,8,0.25);color:var(--yellow);}
+.dedup-banner.no-dups{background:rgba(34,197,94,0.08);border-color:rgba(34,197,94,0.25);color:var(--green);}
 
 /* --- RESULTS TABLE --- */
 .results-wrap{overflow-x:auto;margin-top:1rem;}
@@ -415,6 +542,21 @@ table.results .expand-btn{color:var(--accent);cursor:pointer;font-size:0.7rem;wh
   border-radius:8px;display:none;align-items:center;justify-content:space-between;}
 .download-bar.show{display:flex;}
 
+/* --- SUMMARY CARDS ROW --- */
+.summary-cards{display:none;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:0.75rem;margin-bottom:1rem;}
+.summary-cards.show{display:grid;}
+.summary-card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:0.75rem;text-align:center;}
+.summary-card .sc-num{font-size:1.5rem;font-weight:700;line-height:1.2;}
+.summary-card .sc-label{font-size:0.7rem;color:var(--muted);margin-top:0.15rem;}
+
+/* --- FILTER TABS --- */
+.filter-tabs{display:flex;gap:0.25rem;margin-bottom:0.75rem;flex-wrap:wrap;}
+.filter-tab{padding:0.3rem 0.7rem;border-radius:5px;font-size:0.72rem;font-weight:600;cursor:pointer;
+  background:var(--bg);border:1px solid var(--border);color:var(--muted);transition:all 0.12s;}
+.filter-tab:hover{border-color:var(--accent);color:var(--text);}
+.filter-tab.active{background:rgba(59,130,246,0.12);border-color:var(--accent);color:var(--accent);}
+.filter-tab .ft-count{margin-left:0.3rem;font-weight:400;opacity:0.7;}
+
 .two-col{display:grid;grid-template-columns:340px 1fr;gap:1.25rem;}
 @media(max-width:900px){.two-col{grid-template-columns:1fr;}.step-grid{grid-template-columns:1fr;}}
 </style>
@@ -433,6 +575,24 @@ table.results .expand-btn{color:var(--accent);cursor:pointer;font-size:0.7rem;wh
 
 <!-- ============== PAGE 1: RUN ============== -->
 <div class="page active" id="page-run">
+
+<!-- Pipeline Tracker -->
+<div class="pipeline-tracker" id="pipeline-tracker">
+  <div class="pipe-step" id="pipe-upload"><span class="pipe-num">0</span><span class="pipe-label">Upload</span></div>
+  <span class="pipe-arrow">&rarr;</span>
+  <div class="pipe-step" id="pipe-dedup"><span class="pipe-num">1</span><span class="pipe-label">Deduplicate</span><span class="pipe-count"></span></div>
+  <span class="pipe-arrow">&rarr;</span>
+  <div class="pipe-step" id="pipe-screen"><span class="pipe-num">2</span><span class="pipe-label">Screen</span><span class="pipe-count"></span></div>
+  <span class="pipe-arrow">&rarr;</span>
+  <div class="pipe-step" id="pipe-path"><span class="pipe-num">3</span><span class="pipe-label">Path</span><span class="pipe-count"></span></div>
+  <span class="pipe-arrow">&rarr;</span>
+  <div class="pipe-step" id="pipe-cg"><span class="pipe-num">4</span><span class="pipe-label">CG Tags</span><span class="pipe-count"></span></div>
+  <span class="pipe-arrow">&rarr;</span>
+  <div class="pipe-step" id="pipe-esg"><span class="pipe-num">5</span><span class="pipe-label">ESG Tags</span><span class="pipe-count"></span></div>
+  <span class="pipe-arrow">&rarr;</span>
+  <div class="pipe-step" id="pipe-meta"><span class="pipe-num">6</span><span class="pipe-label">Meta Score</span><span class="pipe-count"></span></div>
+</div>
+
 <div class="two-col">
   <div>
     <div class="card">
@@ -458,12 +618,15 @@ table.results .expand-btn{color:var(--accent);cursor:pointer;font-size:0.7rem;wh
       <label>Max articles (0 = all)</label>
       <input type="number" id="max-articles" value="5" min="0">
       <div class="btn-row">
-        <button class="btn btn-primary" id="run-btn" onclick="startRun()" disabled>Run Brain</button>
+        <button class="btn btn-primary" id="run-btn" onclick="startRun()" disabled>Run Pipeline</button>
         <button class="btn btn-ghost" onclick="location.reload()">Reset</button>
       </div>
     </div>
   </div>
   <div>
+    <!-- Dedup Banner -->
+    <div class="dedup-banner" id="dedup-banner"></div>
+
     <div class="card">
       <h2>Progress</h2>
       <div class="stats-row">
@@ -471,19 +634,22 @@ table.results .expand-btn{color:var(--accent);cursor:pointer;font-size:0.7rem;wh
         <div class="stat-box"><div class="num" id="s-total">0</div><div class="label">Total</div></div>
         <div class="stat-box"><div class="num" style="color:var(--green)" id="s-inc">0</div><div class="label">Include</div></div>
         <div class="stat-box"><div class="num" style="color:var(--red)" id="s-exc">0</div><div class="label">Exclude</div></div>
+        <div class="stat-box"><div class="num" style="color:var(--yellow)" id="s-bg">0</div><div class="label">Background</div></div>
         <div class="stat-box"><div class="num" style="color:var(--red)" id="s-err">0</div><div class="label">Errors</div></div>
       </div>
       <div class="progress-bar"><div class="progress-fill" id="pbar"></div></div>
       <div class="download-bar" id="download-bar">
-        <span style="color:var(--green);font-weight:600;">Done!</span>
-        <button class="btn btn-green btn-sm" onclick="downloadResult()">Download .xlsx</button>
-        <button class="btn btn-ghost btn-sm" onclick="showPage('results')">View Table</button>
+        <span style="color:var(--green);font-weight:600;">Pipeline complete!</span>
+        <div style="display:flex;gap:0.5rem;">
+          <button class="btn btn-green btn-sm" onclick="downloadResult()">Download .xlsx</button>
+          <button class="btn btn-ghost btn-sm" onclick="showPage('results')">View Results</button>
+        </div>
       </div>
     </div>
     <div class="card" style="margin-top:1rem;">
       <h2>Live Feed</h2>
       <div id="live-feed" style="max-height:50vh;overflow-y:auto;font-size:0.78rem;font-family:monospace;">
-        <div style="color:var(--dim);padding:1rem;text-align:center;">Upload a file and click Run</div>
+        <div style="color:var(--dim);padding:1rem;text-align:center;">Upload a file and click Run Pipeline</div>
       </div>
     </div>
   </div>
@@ -504,8 +670,22 @@ table.results .expand-btn{color:var(--accent);cursor:pointer;font-size:0.7rem;wh
 
 <!-- ============== PAGE 3: RESULTS TABLE ============== -->
 <div class="page" id="page-results">
+<!-- Summary Cards -->
+<div class="summary-cards" id="summary-cards">
+  <div class="summary-card"><div class="sc-num" id="sc-total" style="color:var(--accent)">0</div><div class="sc-label">Total Screened</div></div>
+  <div class="summary-card"><div class="sc-num" id="sc-dedup" style="color:var(--yellow)">0</div><div class="sc-label">Duplicates Removed</div></div>
+  <div class="summary-card"><div class="sc-num" id="sc-include" style="color:var(--green)">0</div><div class="sc-label">Included</div></div>
+  <div class="summary-card"><div class="sc-num" id="sc-exclude" style="color:var(--red)">0</div><div class="sc-label">Excluded</div></div>
+  <div class="summary-card"><div class="sc-num" id="sc-background" style="color:var(--yellow)">0</div><div class="sc-label">Background</div></div>
+  <div class="summary-card"><div class="sc-num" id="sc-patha" style="color:var(--accent)">0</div><div class="sc-label">Path A</div></div>
+  <div class="summary-card"><div class="sc-num" id="sc-both" style="color:var(--purple)">0</div><div class="sc-label">Both A+B</div></div>
+  <div class="summary-card"><div class="sc-num" id="sc-pathb" style="color:var(--orange)">0</div><div class="sc-label">Path B</div></div>
+</div>
+
 <div class="card">
-  <h2>Intermediate Results <span style="font-weight:400;text-transform:none;letter-spacing:0;" id="result-count"></span></h2>
+  <h2>Results <span style="font-weight:400;text-transform:none;letter-spacing:0;" id="result-count"></span></h2>
+  <!-- Filter Tabs -->
+  <div class="filter-tabs" id="filter-tabs"></div>
   <div class="results-wrap">
     <table class="results" id="results-table">
       <thead>
@@ -513,16 +693,17 @@ table.results .expand-btn{color:var(--accent);cursor:pointer;font-size:0.7rem;wh
           <th>#</th>
           <th>Title</th>
           <th>Step 1: Screen</th>
+          <th>Code</th>
           <th>Step 2: Path</th>
           <th>Step 3: CG Tags</th>
           <th>Step 4: ESG Tags</th>
           <th>Step 5: Meta</th>
-          <th>Confidence</th>
+          <th>Conf.</th>
           <th>Detail</th>
         </tr>
       </thead>
       <tbody id="results-body">
-        <tr><td colspan="9" style="text-align:center;color:var(--dim);padding:2rem;">Run the pipeline first</td></tr>
+        <tr><td colspan="10" style="text-align:center;color:var(--dim);padding:2rem;">Run the pipeline first</td></tr>
       </tbody>
     </table>
   </div>
@@ -532,7 +713,8 @@ table.results .expand-btn{color:var(--accent);cursor:pointer;font-size:0.7rem;wh
 <script>
 // --- State ---
 let filePath=null, jobId=null, pollInterval=null;
-let allPrompts=[], activeStep=0, allLogs=[];
+let allPrompts=[], activeStep=0, allLogs=[], lastDedup=null;
+let activeFilter='all';
 
 // --- Page Nav ---
 function showPage(id){
@@ -542,6 +724,61 @@ function showPage(id){
   document.querySelector(`.tab[onclick="showPage('${id}')"]`).classList.add('active');
   if(id==='prompts'&&allPrompts.length===0) loadPrompts();
   if(id==='results') renderResultsTable();
+}
+
+// --- Pipeline Tracker ---
+function updatePipelineTracker(status, logs, dedup){
+  const steps=['upload','dedup','screen','path','cg','esg','meta'];
+  // Reset all
+  steps.forEach(s=>{
+    const el=document.getElementById('pipe-'+s);
+    el.className='pipe-step';
+    const cnt=el.querySelector('.pipe-count');
+    if(cnt) cnt.textContent='';
+  });
+
+  if(!status||status==='queued') {
+    if(filePath) document.getElementById('pipe-upload').classList.add('done');
+    return;
+  }
+
+  // Upload always done once running
+  document.getElementById('pipe-upload').classList.add('done');
+
+  if(status==='dedup'){
+    document.getElementById('pipe-dedup').classList.add('active');
+    return;
+  }
+
+  // Dedup done
+  if(dedup){
+    document.getElementById('pipe-dedup').classList.add('done');
+    const dc=document.getElementById('pipe-dedup').querySelector('.pipe-count');
+    if(dc) dc.textContent=dedup.removed>0?`-${dedup.removed}`:'';
+  }
+
+  if(status==='screening'||status==='done'){
+    let incCount=0;
+    (logs||[]).forEach(l=>{
+      if(l.status==='Include') incCount++;
+    });
+
+    const finished=logs?logs.filter(l=>l.status&&l.status!=='processing').length:0;
+
+    // Screen step
+    const screenEl=document.getElementById('pipe-screen');
+    if(finished>0||status==='done') screenEl.classList.add(status==='done'?'done':'active');
+    const screenCnt=screenEl.querySelector('.pipe-count');
+    if(screenCnt&&finished>0) screenCnt.textContent=`${finished}`;
+
+    // Steps 3-6 only for included
+    ['path','cg','esg','meta'].forEach(s=>{
+      const el=document.getElementById('pipe-'+s);
+      if(incCount>0) el.classList.add(status==='done'?'done':'active');
+      const cnt=el.querySelector('.pipe-count');
+      if(cnt&&incCount>0) cnt.textContent=`${incCount}`;
+    });
+  }
 }
 
 // --- Upload ---
@@ -556,11 +793,12 @@ function uploadFile(file){
   document.getElementById('file-info').style.display='block';
   document.getElementById('file-info').innerHTML='Uploading...';
   fetch('/upload',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{
-    if(d.error){document.getElementById('file-info').innerHTML='<span style="color:var(--red)">'+d.error+'</span>';return;}
+    if(d.error){document.getElementById('file-info').innerHTML='<span style="color:var(--red)">'+escHtml(d.error)+'</span>';return;}
     filePath=d.file_path;
-    document.getElementById('file-info').innerHTML='<strong>'+file.name+'</strong> — '+d.rows+' articles';
+    document.getElementById('file-info').innerHTML='<strong>'+escHtml(file.name)+'</strong> — '+d.rows+' articles found';
     document.getElementById('run-btn').disabled=false;
     document.getElementById('s-total').textContent=d.rows;
+    updatePipelineTracker(null);
   });
 }
 
@@ -574,7 +812,7 @@ function startRun(){
   if(!key){alert('Enter API key');return;} if(!filePath){alert('Upload file first');return;}
   document.getElementById('run-btn').disabled=true;
   document.getElementById('live-feed').innerHTML='';
-  allLogs=[];
+  allLogs=[]; lastDedup=null;
   fetch('/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
     file_path:filePath, provider:document.getElementById('provider').value,
     api_key:key, model:document.getElementById('model').value,
@@ -590,14 +828,37 @@ function pollStatus(){
   if(!jobId)return;
   fetch('/status/'+jobId).then(r=>r.json()).then(d=>{
     document.getElementById('s-done').textContent=d.progress;
+    document.getElementById('s-total').textContent=d.total;
     document.getElementById('s-err').textContent=d.errors;
     document.getElementById('pbar').style.width=(d.total>0?(d.progress/d.total*100):0)+'%';
     allLogs=d.log||[];
-    let inc=0,exc=0;
-    allLogs.forEach(l=>{if(l.status==='Include')inc++;if(l.status==='Exclude')exc++;});
+
+    // Dedup banner
+    if(d.dedup){
+      lastDedup=d.dedup;
+      const banner=document.getElementById('dedup-banner');
+      if(d.dedup.removed>0){
+        banner.className='dedup-banner show has-dups';
+        banner.innerHTML='<strong>Step 1 — Deduplication:</strong> Removed '+d.dedup.removed+' duplicates. '+d.dedup.kept+' unique articles proceed to screening.';
+      } else {
+        banner.className='dedup-banner show no-dups';
+        banner.innerHTML='<strong>Step 1 — Deduplication:</strong> No duplicates found. All '+d.dedup.kept+' articles proceed to screening.';
+      }
+    }
+
+    let inc=0,exc=0,bg=0;
+    allLogs.forEach(l=>{
+      if(l.status==='Include')inc++;
+      if(l.status==='Exclude')exc++;
+      if(l.status==='Background')bg++;
+    });
     document.getElementById('s-inc').textContent=inc;
     document.getElementById('s-exc').textContent=exc;
-    renderLiveFeed(allLogs.slice(-30));
+    document.getElementById('s-bg').textContent=bg;
+
+    updatePipelineTracker(d.status, allLogs, d.dedup);
+    renderLiveFeed(allLogs.slice(-40));
+
     if(d.status==='done'){
       clearInterval(pollInterval);
       document.getElementById('download-bar').classList.add('show');
@@ -608,18 +869,25 @@ function pollStatus(){
 
 function renderLiveFeed(logs){
   const el=document.getElementById('live-feed');
+  const stepLabels={screener:'Screening',path:'Path',cg:'CG Tags',esg:'ESG Tags',meta:'Meta Score',done:'Done',error:'Error'};
   el.innerHTML=logs.map(l=>{
     const bc=l.status==='Include'?'b-include':l.status==='Exclude'?'b-exclude':
              l.status==='Background'?'b-background':l.status?.startsWith('ERROR')?'b-error':'b-processing';
     const s=l.summary||{};
+    const curStep=l.current_step?stepLabels[l.current_step]||l.current_step:'';
     let extra='';
-    if(s.path) extra+=` <span style="color:var(--dim)">${s.path.replace('Path_A_CG_to_ESG','A').replace('Both_A_and_B','A+B').replace('Path_B_ESG_to_FP_with_CG_moderation','B')}</span>`;
-    if(s.meta) extra+=` <span class="badge b-${s.meta.toLowerCase()}">${s.meta}</span>`;
-    return `<div style="padding:0.3rem 0;border-bottom:1px solid rgba(51,65,85,0.3);display:flex;gap:0.5rem;align-items:center;">
-      <span style="color:var(--dim);min-width:1.5rem;text-align:right;">${l.i}</span>
-      <span class="badge ${bc}">${l.status}</span>${extra}
-      <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${l.title||''}</span>
-    </div>`;
+    if(l.status==='processing'&&curStep){
+      extra=' <span style="color:var(--accent);font-size:0.7rem;">'+curStep+'...</span>';
+    } else {
+      if(s.exclusion_code) extra+=' <span style="color:var(--dim);font-size:0.7rem;">'+escHtml(s.exclusion_code)+'</span>';
+      if(s.path) extra+=' <span style="color:var(--dim);font-size:0.7rem;">'+escHtml(s.path.replace('Path_A_CG_to_ESG','A').replace('Both_A_and_B','A+B').replace('Path_B_ESG_to_FP_with_CG_moderation','B'))+'</span>';
+      if(s.meta) extra+=' <span class="badge b-'+s.meta.toLowerCase()+'">'+escHtml(s.meta)+'</span>';
+    }
+    return '<div style="padding:0.3rem 0;border-bottom:1px solid rgba(51,65,85,0.3);display:flex;gap:0.5rem;align-items:center;">'+
+      '<span style="color:var(--dim);min-width:1.5rem;text-align:right;">'+l.i+'</span>'+
+      '<span class="badge '+bc+'">'+(l.status||'...')+'</span>'+extra+
+      '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'+escHtml(l.title||'')+'</span>'+
+    '</div>';
   }).join('');
   el.scrollTop=el.scrollHeight;
 }
@@ -640,7 +908,7 @@ function renderStepNav(){
   nav.innerHTML=allPrompts.map((p,i)=>`
     <div class="step-nav-item ${i===activeStep?'active':''}" onclick="selectStep(${i})">
       <span class="num">${i+1}</span>
-      <span>${p.label}</span>
+      <span>${escHtml(p.label)}</span>
       <span class="example-count">${p.num_examples} ex</span>
     </div>`).join('');
 }
@@ -651,8 +919,8 @@ function selectStep(i){
   const p=allPrompts[i];
   const ed=document.getElementById('step-editor');
   ed.innerHTML=`
-    <div class="step-title">${p.label}</div>
-    <div class="step-desc">${p.desc} &nbsp;—&nbsp; <code>${p.file}</code></div>
+    <div class="step-title">${escHtml(p.label)}</div>
+    <div class="step-desc">${escHtml(p.desc)} &nbsp;—&nbsp; <code>${escHtml(p.file)}</code></div>
 
     <label>Prompt Logic <span style="color:var(--dim)">(Markdown — edit freely)</span></label>
     <textarea id="prompt-content" rows="18">${escHtml(p.content)}</textarea>
@@ -687,11 +955,64 @@ function saveStep(i){
 }
 
 // --- Results Table ---
+function computeStats(){
+  let inc=0,exc=0,bg=0,pathA=0,both=0,pathB=0;
+  allLogs.forEach(l=>{
+    const s=l.summary||{};
+    if(s.status==='Include')inc++;
+    if(s.status==='Exclude')exc++;
+    if(s.status==='Background')bg++;
+    if(s.path==='Path_A_CG_to_ESG')pathA++;
+    if(s.path==='Both_A_and_B')both++;
+    if(s.path==='Path_B_ESG_to_FP_with_CG_moderation')pathB++;
+  });
+  return {total:allLogs.length, inc, exc, bg, pathA, both, pathB, dedup: lastDedup?lastDedup.removed:0};
+}
+
+function renderFilterTabs(){
+  const stats=computeStats();
+  const container=document.getElementById('filter-tabs');
+  const filters=[
+    {key:'all', label:'All', count:stats.total},
+    {key:'Include', label:'Include', count:stats.inc},
+    {key:'Exclude', label:'Exclude', count:stats.exc},
+    {key:'Background', label:'Background', count:stats.bg},
+  ];
+  container.innerHTML=filters.map(f=>
+    '<div class="filter-tab '+(activeFilter===f.key?'active':'')+'" onclick="setFilter(\''+f.key+'\')">'+f.label+'<span class="ft-count">'+f.count+'</span></div>'
+  ).join('');
+}
+
+function setFilter(f){
+  activeFilter=f;
+  renderResultsTable();
+}
+
 function renderResultsTable(){
   const body=document.getElementById('results-body');
-  if(!allLogs.length){body.innerHTML='<tr><td colspan="9" style="text-align:center;color:var(--dim);padding:2rem;">No results yet. Run the pipeline first.</td></tr>';return;}
-  document.getElementById('result-count').textContent=`(${allLogs.length} articles)`;
-  body.innerHTML=allLogs.map((l,idx)=>{
+  if(!allLogs.length){body.innerHTML='<tr><td colspan="10" style="text-align:center;color:var(--dim);padding:2rem;">No results yet. Run the pipeline first.</td></tr>';return;}
+
+  const stats=computeStats();
+
+  // Update summary cards
+  const sc=document.getElementById('summary-cards');
+  sc.classList.add('show');
+  document.getElementById('sc-total').textContent=stats.total;
+  document.getElementById('sc-dedup').textContent=stats.dedup;
+  document.getElementById('sc-include').textContent=stats.inc;
+  document.getElementById('sc-exclude').textContent=stats.exc;
+  document.getElementById('sc-background').textContent=stats.bg;
+  document.getElementById('sc-patha').textContent=stats.pathA;
+  document.getElementById('sc-both').textContent=stats.both;
+  document.getElementById('sc-pathb').textContent=stats.pathB;
+
+  renderFilterTabs();
+
+  // Filter logs
+  const filtered=activeFilter==='all'?allLogs:allLogs.filter(l=>(l.summary||{}).status===activeFilter);
+  document.getElementById('result-count').textContent='('+filtered.length+' of '+allLogs.length+' articles)';
+
+  body.innerHTML=filtered.map((l,idx)=>{
     const s=l.summary||{};
     const bc=s.status==='Include'?'b-include':s.status==='Exclude'?'b-exclude':
              s.status==='Background'?'b-background':'b-error';
@@ -700,30 +1021,31 @@ function renderResultsTable(){
     const cgShort=(s.cg||'').replace(/;/g,'; ').replace(/_/g,' ');
     const esgShort=(s.esg||'').replace(/;/g,'; ').replace(/_/g,' ');
     const conf=typeof s.confidence==='number'?(s.confidence*100).toFixed(0)+'%':'';
+    const realIdx=allLogs.indexOf(l);
 
-    return `<tr>
-      <td>${l.i}</td>
-      <td title="${escAttr(l.title)}" style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${l.title||''}</td>
-      <td><span class="badge ${bc}">${s.status||'?'}</span></td>
-      <td>${pathShort||'—'}</td>
-      <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;" title="${escAttr(cgShort)}">${cgShort||'—'}</td>
-      <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;" title="${escAttr(esgShort)}">${esgShort||'—'}</td>
-      <td><span class="badge ${mc}">${s.meta||'—'}</span></td>
-      <td>${conf}</td>
-      <td><span class="expand-btn" onclick="toggleDetail(${idx})">show</span></td>
-    </tr>
-    <tr class="detail-row" id="detail-${idx}" style="display:none;">
-      <td colspan="9">
-        <div class="detail-inner">
-          ${Object.entries(l.step_results||{}).map(([k,v])=>`
-            <div class="detail-box">
-              <h4>${k}</h4>
-              <pre>${typeof v==='object'?JSON.stringify(v,null,2):v}</pre>
-            </div>`).join('')}
-          ${s.reasoning?`<div class="detail-box"><h4>Reasoning</h4><pre>${s.reasoning}</pre></div>`:''}
-        </div>
-      </td>
-    </tr>`;
+    return '<tr>'+
+      '<td>'+l.i+'</td>'+
+      '<td title="'+escAttr(l.title)+'" style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'+escHtml(l.title||'')+'</td>'+
+      '<td><span class="badge '+bc+'">'+(s.status||'?')+'</span></td>'+
+      '<td style="color:var(--dim);font-size:0.7rem;">'+(s.exclusion_code||'')+'</td>'+
+      '<td>'+(pathShort||'—')+'</td>'+
+      '<td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;" title="'+escAttr(cgShort)+'">'+(cgShort||'—')+'</td>'+
+      '<td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;" title="'+escAttr(esgShort)+'">'+(esgShort||'—')+'</td>'+
+      '<td><span class="badge '+mc+'">'+(s.meta||'—')+'</span></td>'+
+      '<td>'+conf+'</td>'+
+      '<td><span class="expand-btn" onclick="toggleDetail('+realIdx+')">show</span></td>'+
+    '</tr>'+
+    '<tr class="detail-row" id="detail-'+realIdx+'" style="display:none;">'+
+      '<td colspan="10">'+
+        '<div class="detail-inner">'+
+          Object.entries(l.step_results||{}).map(function(entry){
+            var k=entry[0],v=entry[1];
+            return '<div class="detail-box"><h4>'+escHtml(k)+'</h4><pre>'+escHtml(typeof v==='object'?JSON.stringify(v,null,2):String(v))+'</pre></div>';
+          }).join('')+
+          (s.reasoning?'<div class="detail-box"><h4>Screening Reasoning</h4><pre>'+escHtml(s.reasoning)+'</pre></div>':'')+
+        '</div>'+
+      '</td>'+
+    '</tr>';
   }).join('');
 }
 
@@ -734,7 +1056,7 @@ function toggleDetail(idx){
 
 // --- Util ---
 function escHtml(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-function escAttr(s){return (s||'').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+function escAttr(s){return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 </script>
 </body>
 </html>"""
