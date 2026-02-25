@@ -137,20 +137,31 @@ def parse_uploaded_file(fpath):
         if fpath.endswith(".csv"):
             df = pd.read_csv(fpath)
         else:
+            def _has_title_col(d):
+                return any(c in d.columns for c in ("Title", "title", "Article Title"))
             df = pd.read_excel(fpath, header=1)
-            if "Title" not in df.columns and "title" not in df.columns:
+            if not _has_title_col(df):
                 df = pd.read_excel(fpath, header=0)
-            if "Title" not in df.columns and "title" not in df.columns:
+            if not _has_title_col(df):
                 xls = pd.ExcelFile(fpath)
                 for s in xls.sheet_names:
                     df = pd.read_excel(xls, s, header=1)
-                    if "Title" in df.columns or "title" in df.columns:
+                    if _has_title_col(df):
                         break
     except Exception as e:
         return None, f"Could not read file: {e}"
 
     col_map = {c: c.strip() for c in df.columns}
     df.rename(columns=col_map, inplace=True)
+
+    # Normalize known column aliases (e.g., WOS uses "Article Title" instead of "Title")
+    alias_map = {
+        "Article Title": "Title",
+        "Source Title": "Journal",
+        "Author Keywords": "Author_Keywords",
+        "Publication Year": "Year",
+    }
+    df.rename(columns={k: v for k, v in alias_map.items() if k in df.columns}, inplace=True)
 
     if "Title" not in df.columns and "title" not in df.columns:
         return None, f"No 'Title' column found. Columns: {list(df.columns)[:10]}"
