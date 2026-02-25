@@ -1,6 +1,6 @@
 # SLR Brain — AI Screening Pipeline for Systematic Literature Reviews
 
-A local Flask web app that classifies academic articles through a 6-step AI pipeline using OpenAI or Anthropic APIs. Built for SLR research on Corporate Governance (CG) → ESG outcomes.
+A local Flask web app that classifies academic articles through a 6-step AI pipeline using OpenAI, Anthropic, or Google Gemini APIs. Built for SLR research on Corporate Governance (CG) → ESG outcomes.
 
 ## Quick Start
 
@@ -33,23 +33,28 @@ If Step 2 = Exclude or Background, Steps 3-6 are skipped (saves cost).
 ### Tab 1: Run Pipeline
 - **Pipeline tracker** at the top shows each step with live progress counts
 - Drag & drop Excel/CSV
-- Choose provider (OpenAI or Anthropic) and model
-- Enter API key, set max articles (use 5 for testing)
+- Choose provider (OpenAI, Anthropic, or Google) with **model dropdown** — no need to memorize model IDs
+- **API key auto-saved** in browser localStorage (per provider)
+- Set max articles and **parallel workers** (concurrent processing for speed)
+- **Timer/ETA** shows elapsed time and estimated remaining time
 - **Deduplication banner** shows how many duplicates were removed
 - **Live feed** shows each article being processed with current step indicator
 - **Stats bar** tracks Include/Exclude/Background counts in real-time
 
 ### Tab 2: Prompt Editor
-- View/edit all 5 prompt templates in a sidebar layout
-- Edit few-shot examples (JSONL format) for each step
-- Click "Save Changes" — next run uses updated logic immediately
-- No restart needed
+- **Simple mode** (default): Visual example cards with title, abstract, and expected output as badges
+  - **Add Example** form with dropdowns and checkboxes — no raw JSON needed
+  - Delete individual examples with one click
+- **Advanced mode** (toggle): Raw Markdown prompt + JSONL for power users
+- Sidebar navigation between all 5 steps
+- Changes take effect on the next run immediately
 
 ### Tab 3: Results Table
 - **Summary cards** showing totals: screened, duplicates removed, include/exclude/background, path breakdown
 - **Filter tabs** to show All / Include only / Exclude only / Background only
 - Full results with columns: Screen status, Exclusion Code, Path, CG tags, ESG tags, Meta score, Confidence
 - Click "show" on any row to expand raw API responses from all 5 steps
+- **Quick Correct** button on each step — fix a misclassification and save it as a training example in one click
 
 ## Evaluation System
 
@@ -127,14 +132,19 @@ slr-brain-pipeline/
 ## Architecture Notes
 
 - **Single-file app**: Everything is in `app.py` (Python backend + HTML/CSS/JS frontend) for simplicity. No build tools needed.
-- **Provider abstraction**: `call_openai()` and `call_anthropic()` share the same interface. Add new providers by adding a function + entry in `PROVIDERS` dict.
-- **Robust JSON parsing**: `extract_json()` handles Anthropic responses that may wrap JSON in markdown code blocks.
+- **Three providers**: `call_openai()`, `call_anthropic()`, and `call_google()` share the same interface. Google Gemini uses REST API (no SDK needed). Reasoning models (o1/o3/o4) handled automatically.
+- **Model catalog**: Pre-configured dropdown with popular models per provider. Custom model IDs also supported.
+- **Concurrent processing**: `ThreadPoolExecutor` processes multiple articles in parallel (configurable workers).
+- **Robust JSON parsing**: `extract_json()` handles responses wrapped in markdown code blocks or extra text.
 - **Retry with backoff**: API calls retry up to 3 times with exponential backoff on transient failures.
 - **Deduplication**: Automatic DOI + normalized title dedup before AI screening begins.
 - **Prompt files are plain Markdown**: Edit in any text editor, or use the built-in Prompt Editor tab.
 - **Examples auto-inject**: The `load_examples()` function reads JSONL files and appends them to the system prompt as few-shot examples.
-- **Threading**: Each pipeline run spawns a thread. The UI polls `/status/<job_id>` every 1.2s for progress.
-- **JSON mode**: OpenAI calls use `response_format={"type": "json_object"}` for reliable parsing.
+- **Quick Correct**: Fix misclassifications directly from the results table — saves corrected examples to JSONL files.
+- **API key persistence**: Keys saved per-provider in browser localStorage.
+- **Timer/ETA**: Real-time elapsed time and estimated remaining time during pipeline runs.
+- **Threading**: Each pipeline run uses `ThreadPoolExecutor` for concurrent article processing. The UI polls `/status/<job_id>` every 800ms.
+- **JSON mode**: OpenAI uses `response_format`, Google Gemini uses `responseMimeType` for reliable JSON parsing.
 
 ## Cost Estimates
 
@@ -142,7 +152,8 @@ slr-brain-pipeline/
 |-------|-------------|-------------------|
 | gpt-4o-mini | ~$0.50 | ~$0.005 |
 | gpt-4o | ~$5 | ~$0.05 |
-| claude-sonnet | ~$3-5 | ~$0.03 |
+| claude-sonnet-4 | ~$3-5 | ~$0.03 |
+| gemini-2.0-flash | ~$0.30 | ~$0.003 |
 
 ## Taxonomy Reference
 

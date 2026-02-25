@@ -1,9 +1,11 @@
 """
-SLR Brain v2 — Web UI with Pipeline Visualization + Prompt Editor + Eval
+SLR Brain v3 — Web UI with Pipeline Visualization + Prompt Editor + Eval + Multi-Provider
 """
 
 import os, json, time, uuid, threading, re
+import urllib.request, urllib.error
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify, send_file
 import pandas as pd
 
@@ -11,21 +13,47 @@ import pandas as pd
 def call_openai(prompt, system_msg, model, api_key, temperature=0.2):
     from openai import OpenAI
     client = OpenAI(api_key=api_key)
-    resp = client.chat.completions.create(
-        model=model, temperature=temperature,
-        messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": prompt}],
-        response_format={"type": "json_object"}
-    )
+    # Reasoning models (o1/o3/o4) don't support temperature or system role
+    is_reasoning = model.startswith(('o1', 'o3', 'o4'))
+    if is_reasoning:
+        messages = [{"role": "user", "content": system_msg + "\n\n---\n\n" + prompt}]
+    else:
+        messages = [{"role": "system", "content": system_msg}, {"role": "user", "content": prompt}]
+    kwargs = {"model": model, "messages": messages, "response_format": {"type": "json_object"}}
+    if not is_reasoning:
+        kwargs["temperature"] = temperature
+    resp = client.chat.completions.create(**kwargs)
     return resp.choices[0].message.content
 
 def call_anthropic(prompt, system_msg, model, api_key, temperature=0.2):
     import anthropic
     client = anthropic.Anthropic(api_key=api_key)
     resp = client.messages.create(
-        model=model, max_tokens=1024, temperature=temperature,
+        model=model, max_tokens=4096, temperature=temperature,
         system=system_msg, messages=[{"role": "user", "content": prompt}]
     )
     return resp.content[0].text
+
+def call_google(prompt, system_msg, model, api_key, temperature=0.2):
+    """Call Google Gemini API via REST (no SDK required)."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    payload = {
+        "system_instruction": {"parts": [{"text": system_msg}]},
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": temperature, "responseMimeType": "application/json"}
+    }
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read().decode())
+        return result["candidates"][0]["content"]["parts"][0]["text"]
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode()
+        except Exception:
+            body = str(e)
+        raise RuntimeError(f"Google API error {e.code}: {body[:500]}")
 
 def extract_json(text):
     """Extract JSON from text that might contain markdown code blocks or extra text."""
@@ -65,6 +93,26 @@ def call_with_retry(caller, prompt, system_msg, model, api_key, max_retries=3):
 PROVIDERS = {
     "openai": {"caller": call_openai, "default_model": "gpt-4o-mini"},
     "anthropic": {"caller": call_anthropic, "default_model": "claude-sonnet-4-20250514"},
+    "google": {"caller": call_google, "default_model": "gemini-2.0-flash"},
+}
+
+MODEL_CATALOG = {
+    "openai": [
+        {"id": "gpt-4o-mini", "label": "GPT-4o Mini \u2014 fast & cheap"},
+        {"id": "gpt-4o", "label": "GPT-4o \u2014 balanced"},
+        {"id": "gpt-4-turbo", "label": "GPT-4 Turbo"},
+        {"id": "o3-mini", "label": "o3-mini \u2014 reasoning"},
+    ],
+    "anthropic": [
+        {"id": "claude-sonnet-4-20250514", "label": "Claude Sonnet 4 \u2014 balanced"},
+        {"id": "claude-haiku-4-5-20251001", "label": "Claude Haiku 4.5 \u2014 fast & cheap"},
+        {"id": "claude-opus-4-20250514", "label": "Claude Opus 4 \u2014 most capable"},
+    ],
+    "google": [
+        {"id": "gemini-2.0-flash", "label": "Gemini 2.0 Flash \u2014 fast & cheap"},
+        {"id": "gemini-2.5-flash-preview-05-20", "label": "Gemini 2.5 Flash"},
+        {"id": "gemini-2.5-pro-preview-05-06", "label": "Gemini 2.5 Pro \u2014 most capable"},
+    ],
 }
 
 # --- Prompt Loader ---
@@ -233,7 +281,7 @@ def classify_article(row, provider_name, api_key, model, log_entry=None):
 # --- Job Management ---
 JOBS = {}
 
-def run_job(job_id, df, provider_name, api_key, model):
+def run_job(job_id, df, provider_name, api_key, model, max_workers=3):
     job = JOBS[job_id]
     job["status"] = "dedup"
 
@@ -245,19 +293,24 @@ def run_job(job_id, df, provider_name, api_key, model):
     job["status"] = "screening"
     job["total"] = len(df)
     job["log"] = []
-    results_list = []
+    results_dict = {}
 
+    # Pre-create log entries so UI can show all articles immediately
+    work_items = []
     for i, (_, row) in enumerate(df.iterrows()):
-        job["progress"] = i
         title_short = str(row.get("Title", row.get("title", "")))[:80]
-        log_entry = {"i": i+1, "title": title_short, "status": "processing", "current_step": "screener",
+        abstract_short = str(row.get("Abstract", row.get("abstract", "")))[:500]
+        log_entry = {"i": i+1, "title": title_short, "abstract": abstract_short,
+                     "status": "processing", "current_step": "queued",
                      "step_results": {}, "raw": {}}
         job["log"].append(log_entry)
+        work_items.append((i, row, log_entry))
 
+    def process_one(i, row, log_entry):
+        log_entry["current_step"] = "screener"
         try:
             result = classify_article(row, provider_name, api_key, model, log_entry)
             result["_original_row"] = row.to_dict()
-            results_list.append(result)
             log_entry["status"] = result.get("status", "?")
             log_entry["raw"] = result.get("raw_responses", {})
             log_entry["step_results"] = result.get("step_results", {})
@@ -271,13 +324,23 @@ def run_job(job_id, df, provider_name, api_key, model):
                 "confidence": result.get("screen_confidence", ""),
                 "reasoning": result.get("screen_reasoning", ""),
             }
+            return i, result
         except Exception as e:
             job["errors"] += 1
             log_entry["status"] = f"ERROR: {e}"
             log_entry["current_step"] = "error"
-            results_list.append({"status": "ERROR", "_original_row": row.to_dict()})
+            return i, {"status": "ERROR", "_original_row": row.to_dict()}
 
-    # Build output Excel
+    effective_workers = max(1, min(max_workers, len(work_items)))
+    with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+        futures = {executor.submit(process_one, i, row, le): i for i, row, le in work_items}
+        for future in as_completed(futures):
+            idx, result = future.result()
+            results_dict[idx] = result
+            job["progress"] = len(results_dict)
+
+    # Build output Excel (preserve original order)
+    results_list = [results_dict.get(i, {"status": "ERROR", "_original_row": {}}) for i in range(len(df))]
     out_rows = []
     for r in results_list:
         orig = r.get("_original_row", {})
@@ -314,22 +377,34 @@ def index():
     return HTML_PAGE
 
 # --- Prompt CRUD ---
+@app.route("/api/models")
+def get_models():
+    return jsonify(MODEL_CATALOG)
+
 @app.route("/api/prompts")
 def get_prompts():
     result = []
     for prompt_file, step_name, output_key, label, desc in STEPS:
         content = load_prompt(prompt_file)
         examples_path = EXAMPLE_DIR / f"{step_name}.jsonl"
-        examples_content = examples_path.read_text() if examples_path.exists() else ""
-        num_examples = len([l for l in examples_content.strip().split("\n") if l.strip()]) if examples_content.strip() else 0
+        examples_raw = examples_path.read_text() if examples_path.exists() else ""
+        examples_parsed = []
+        if examples_raw.strip():
+            for line in examples_raw.strip().split("\n"):
+                if line.strip():
+                    try:
+                        examples_parsed.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
         result.append({
             "file": prompt_file,
             "step": step_name,
             "label": label,
             "desc": desc,
             "content": content,
-            "examples": examples_content,
-            "num_examples": num_examples,
+            "examples_raw": examples_raw,
+            "examples": examples_parsed,
+            "num_examples": len(examples_parsed),
         })
     return jsonify(result)
 
@@ -344,6 +419,50 @@ def save_prompt(step):
                 (EXAMPLE_DIR / f"{step_name}.jsonl").write_text(data["examples"])
             return jsonify({"ok": True})
     return jsonify({"error": "Unknown step"}), 404
+
+@app.route("/api/examples/<step>", methods=["GET"])
+def get_examples(step):
+    valid_steps = [s[1] for s in STEPS]
+    if step not in valid_steps:
+        return jsonify({"error": "Unknown step"}), 404
+    path = EXAMPLE_DIR / f"{step}.jsonl"
+    if not path.exists():
+        return jsonify([])
+    examples = []
+    for line in path.read_text().strip().split("\n"):
+        if line.strip():
+            try:
+                examples.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return jsonify(examples)
+
+@app.route("/api/examples/<step>", methods=["POST"])
+def add_example(step):
+    valid_steps = [s[1] for s in STEPS]
+    if step not in valid_steps:
+        return jsonify({"error": "Unknown step"}), 404
+    data = request.json
+    example = {"title": data.get("title", ""), "abstract": data.get("abstract", ""), "expected": data.get("expected", {})}
+    path = EXAMPLE_DIR / f"{step}.jsonl"
+    with open(path, "a") as f:
+        f.write(json.dumps(example) + "\n")
+    return jsonify({"ok": True})
+
+@app.route("/api/examples/<step>/<int:index>", methods=["DELETE"])
+def delete_example(step, index):
+    valid_steps = [s[1] for s in STEPS]
+    if step not in valid_steps:
+        return jsonify({"error": "Unknown step"}), 404
+    path = EXAMPLE_DIR / f"{step}.jsonl"
+    if not path.exists():
+        return jsonify({"error": "No examples file"}), 404
+    lines = [l for l in path.read_text().strip().split("\n") if l.strip()]
+    if index < 0 or index >= len(lines):
+        return jsonify({"error": "Index out of range"}), 400
+    lines.pop(index)
+    path.write_text("\n".join(lines) + "\n" if lines else "")
+    return jsonify({"ok": True})
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -367,6 +486,7 @@ def run():
     api_key = data.get("api_key", "")
     model = data.get("model", PROVIDERS[provider]["default_model"])
     max_articles = data.get("max_articles", 0)
+    max_workers = data.get("max_workers", 3)
     if not api_key:
         return jsonify({"error": "API key required"}), 400
     df, err = parse_uploaded_file(fpath)
@@ -376,7 +496,7 @@ def run():
         df = df.head(max_articles)
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {"status": "queued", "progress": 0, "total": len(df), "errors": 0, "log": [], "dedup": None}
-    thread = threading.Thread(target=run_job, args=(job_id, df, provider, api_key, model))
+    thread = threading.Thread(target=run_job, args=(job_id, df, provider, api_key, model, max_workers))
     thread.start()
     return jsonify({"job_id": job_id, "total": len(df)})
 
@@ -400,14 +520,14 @@ def download(job_id):
     return send_file(job["output_path"], as_attachment=True)
 
 # =====================================================
-# HTML UI v3 — Pipeline Visualization
+# HTML UI v3 — Pipeline + Prompt Editor + Quick Correct + Multi-Provider
 # =====================================================
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SLR Brain v2</title>
+<title>SLR Brain v3</title>
 <style>
 :root{--bg:#0b1120;--bg2:#111827;--card:#1e293b;--border:#334155;--accent:#3b82f6;
 --green:#22c55e;--red:#ef4444;--yellow:#eab308;--orange:#f97316;--purple:#a855f7;
@@ -559,6 +679,40 @@ table.results .expand-btn{color:var(--accent);cursor:pointer;font-size:0.7rem;wh
 
 .two-col{display:grid;grid-template-columns:340px 1fr;gap:1.25rem;}
 @media(max-width:900px){.two-col{grid-template-columns:1fr;}.step-grid{grid-template-columns:1fr;}}
+
+/* --- EXAMPLE CARDS --- */
+.example-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:0.6rem;margin-top:0.75rem;}
+.example-card{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:0.65rem 0.75rem;position:relative;transition:border-color 0.15s;}
+.example-card:hover{border-color:var(--accent);}
+.example-card .ec-title{font-weight:600;font-size:0.8rem;margin-bottom:0.2rem;line-height:1.3;padding-right:1.5rem;}
+.example-card .ec-abstract{font-size:0.7rem;color:var(--muted);line-height:1.35;margin-bottom:0.4rem;max-height:2.8em;overflow:hidden;}
+.example-card .ec-expected{display:flex;gap:0.25rem;flex-wrap:wrap;}
+.example-card .ec-delete{position:absolute;top:0.4rem;right:0.5rem;background:none;border:none;color:var(--dim);cursor:pointer;font-size:1.1rem;line-height:1;padding:0.15rem 0.25rem;border-radius:3px;}
+.example-card .ec-delete:hover{color:var(--red);background:rgba(239,68,68,0.1);}
+.badge-sm{padding:0.1rem 0.35rem;border-radius:3px;font-size:0.62rem;font-weight:600;white-space:nowrap;display:inline-block;}
+
+/* --- ADD EXAMPLE FORM --- */
+.add-form{background:var(--bg);border:1px solid var(--accent);border-radius:8px;padding:1rem;margin-top:0.5rem;display:none;}
+.add-form.show{display:block;}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:0.6rem;}
+.checkbox-group{display:flex;flex-wrap:wrap;gap:0.5rem 0.75rem;margin-top:0.25rem;}
+.checkbox-group label{display:flex;align-items:center;gap:0.3rem;font-size:0.76rem;color:var(--text);cursor:pointer;margin:0;}
+.checkbox-group input[type=checkbox]{margin:0;accent-color:var(--accent);}
+
+/* --- MODE TOGGLE --- */
+.mode-toggle{display:flex;gap:0.25rem;margin-bottom:0.75rem;}
+.mode-toggle button{padding:0.3rem 0.65rem;border-radius:5px;font-size:0.72rem;font-weight:600;cursor:pointer;
+  background:var(--bg);border:1px solid var(--border);color:var(--muted);transition:all 0.12s;}
+.mode-toggle button.active{background:rgba(59,130,246,0.12);border-color:var(--accent);color:var(--accent);}
+
+/* --- TIMER --- */
+.timer-display{font-size:0.75rem;color:var(--muted);margin-top:0.3rem;min-height:1.1em;}
+
+/* --- QUICK CORRECT --- */
+.qc-form{margin-top:0.5rem;padding:0.5rem;background:var(--card);border:1px solid var(--accent);border-radius:6px;}
+.qc-form select,.qc-form input{font-size:0.72rem;padding:0.25rem 0.4rem;margin:0.15rem 0;}
+.qc-form label{font-size:0.68rem;margin:0.15rem 0 0;display:flex;align-items:center;gap:0.25rem;}
+.qc-saved{color:var(--green);font-size:0.72rem;font-weight:600;}
 </style>
 </head>
 <body>
@@ -607,16 +761,26 @@ table.results .expand-btn{color:var(--accent);cursor:pointer;font-size:0.7rem;wh
     <div class="card" style="margin-top:1rem;">
       <h2>Configure</h2>
       <label>Provider</label>
-      <select id="provider" onchange="updateModelDefault()">
+      <select id="provider" onchange="updateModelDropdown()">
         <option value="openai">OpenAI</option>
         <option value="anthropic">Anthropic (Claude)</option>
+        <option value="google">Google (Gemini)</option>
       </select>
       <label>Model</label>
-      <input type="text" id="model" value="gpt-4o-mini">
+      <select id="model" onchange="onModelChange()"></select>
+      <input type="text" id="model-custom" placeholder="Type custom model ID" style="display:none;margin-top:0.3rem;">
       <label>API Key</label>
-      <input type="password" id="api-key" placeholder="sk-...">
-      <label>Max articles (0 = all)</label>
-      <input type="number" id="max-articles" value="5" min="0">
+      <input type="password" id="api-key" placeholder="sk-..." onblur="saveApiKey()">
+      <div class="form-row" style="margin-top:0.5rem;">
+        <div>
+          <label>Max articles (0 = all)</label>
+          <input type="number" id="max-articles" value="5" min="0">
+        </div>
+        <div>
+          <label>Parallel workers</label>
+          <input type="number" id="max-workers" value="3" min="1" max="10">
+        </div>
+      </div>
       <div class="btn-row">
         <button class="btn btn-primary" id="run-btn" onclick="startRun()" disabled>Run Pipeline</button>
         <button class="btn btn-ghost" onclick="location.reload()">Reset</button>
@@ -638,6 +802,7 @@ table.results .expand-btn{color:var(--accent);cursor:pointer;font-size:0.7rem;wh
         <div class="stat-box"><div class="num" style="color:var(--red)" id="s-err">0</div><div class="label">Errors</div></div>
       </div>
       <div class="progress-bar"><div class="progress-fill" id="pbar"></div></div>
+      <div class="timer-display" id="timer-display"></div>
       <div class="download-bar" id="download-bar">
         <span style="color:var(--green);font-weight:600;">Pipeline complete!</span>
         <div style="display:flex;gap:0.5rem;">
@@ -715,6 +880,35 @@ table.results .expand-btn{color:var(--accent);cursor:pointer;font-size:0.7rem;wh
 let filePath=null, jobId=null, pollInterval=null;
 let allPrompts=[], activeStep=0, allLogs=[], lastDedup=null;
 let activeFilter='all';
+let editorMode='simple';
+let showAddForm=false;
+let runStartTime=null;
+
+// --- Model Catalog ---
+const MODEL_CATALOG={
+  openai:[
+    {id:'gpt-4o-mini',label:'GPT-4o Mini \u2014 fast & cheap'},
+    {id:'gpt-4o',label:'GPT-4o \u2014 balanced'},
+    {id:'gpt-4-turbo',label:'GPT-4 Turbo'},
+    {id:'o3-mini',label:'o3-mini \u2014 reasoning'},
+  ],
+  anthropic:[
+    {id:'claude-sonnet-4-20250514',label:'Claude Sonnet 4 \u2014 balanced'},
+    {id:'claude-haiku-4-5-20251001',label:'Claude Haiku 4.5 \u2014 fast & cheap'},
+    {id:'claude-opus-4-20250514',label:'Claude Opus 4 \u2014 most capable'},
+  ],
+  google:[
+    {id:'gemini-2.0-flash',label:'Gemini 2.0 Flash \u2014 fast & cheap'},
+    {id:'gemini-2.5-flash-preview-05-20',label:'Gemini 2.5 Flash'},
+    {id:'gemini-2.5-pro-preview-05-06',label:'Gemini 2.5 Pro \u2014 most capable'},
+  ]
+};
+const CG_MECHANISMS=['Board_Structure_Composition','Board_Diversity','Board_Leadership','Board_Committee','Ownership_Structure','Ownership_Concentration','Mixed_CG_Mechanisms'];
+const ESG_OUTCOMES=['ESG_Disclosure_Reporting','ESG_Performance_Rating','CSR_Reporting','E_Pillar','S_Pillar','G_Pillar','Integrated_Reporting','Sustainability_Assurance'];
+const EXCLUSION_CODES=['TA-E1','TA-E2','TA-E5','TA-B1'];
+const PATH_OPTIONS=['Path_A_CG_to_ESG','Both_A_and_B','Path_B_ESG_to_FP_with_CG_moderation'];
+const META_OPTIONS=['High','Medium','Low'];
+const STATUS_OPTIONS=['Include','Exclude','Background'];
 
 // --- Page Nav ---
 function showPage(id){
@@ -802,25 +996,60 @@ function uploadFile(file){
   });
 }
 
-function updateModelDefault(){
-  document.getElementById('model').value=document.getElementById('provider').value==='openai'?'gpt-4o-mini':'claude-sonnet-4-20250514';
+// --- Model Dropdown ---
+function updateModelDropdown(){
+  const prov=document.getElementById('provider').value;
+  const models=MODEL_CATALOG[prov]||[];
+  const sel=document.getElementById('model');
+  sel.innerHTML=models.map(m=>'<option value="'+m.id+'">'+m.label+'</option>').join('')+
+    '<option value="_custom">Other (type model ID)</option>';
+  document.getElementById('model-custom').style.display='none';
+  loadSavedKey();
+}
+function onModelChange(){
+  document.getElementById('model-custom').style.display=
+    document.getElementById('model').value==='_custom'?'block':'none';
+}
+function getSelectedModel(){
+  const v=document.getElementById('model').value;
+  return v==='_custom'?document.getElementById('model-custom').value:v;
+}
+// --- API Key Persistence ---
+function saveApiKey(){
+  const prov=document.getElementById('provider').value;
+  const key=document.getElementById('api-key').value;
+  if(key) localStorage.setItem('slr_key_'+prov,key);
+}
+function loadSavedKey(){
+  const prov=document.getElementById('provider').value;
+  const saved=localStorage.getItem('slr_key_'+prov);
+  if(saved) document.getElementById('api-key').value=saved;
+}
+// --- Timer ---
+function formatTime(s){
+  const m=Math.floor(s/60),sec=Math.floor(s%60);
+  return m>0?m+'m '+sec+'s':sec+'s';
 }
 
 // --- Run ---
 function startRun(){
   const key=document.getElementById('api-key').value;
   if(!key){alert('Enter API key');return;} if(!filePath){alert('Upload file first');return;}
+  saveApiKey();
+  runStartTime=Date.now();
   document.getElementById('run-btn').disabled=true;
   document.getElementById('live-feed').innerHTML='';
+  document.getElementById('timer-display').textContent='';
   allLogs=[]; lastDedup=null;
   fetch('/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
     file_path:filePath, provider:document.getElementById('provider').value,
-    api_key:key, model:document.getElementById('model').value,
-    max_articles:parseInt(document.getElementById('max-articles').value)||0
+    api_key:key, model:getSelectedModel(),
+    max_articles:parseInt(document.getElementById('max-articles').value)||0,
+    max_workers:parseInt(document.getElementById('max-workers').value)||3
   })}).then(r=>r.json()).then(d=>{
     if(d.error){alert(d.error);document.getElementById('run-btn').disabled=false;return;}
     jobId=d.job_id; document.getElementById('s-total').textContent=d.total;
-    pollInterval=setInterval(pollStatus,1200);
+    pollInterval=setInterval(pollStatus,800);
   });
 }
 
@@ -858,6 +1087,20 @@ function pollStatus(){
 
     updatePipelineTracker(d.status, allLogs, d.dedup);
     renderLiveFeed(allLogs.slice(-40));
+
+    // Timer/ETA
+    if(runStartTime&&(d.status==='screening'||d.status==='done')){
+      const elapsed=(Date.now()-runStartTime)/1000;
+      const timerEl=document.getElementById('timer-display');
+      if(d.status==='done'){
+        timerEl.textContent='Completed in '+formatTime(elapsed);
+      } else if(d.progress>0){
+        const eta=elapsed/d.progress*(d.total-d.progress);
+        timerEl.textContent=formatTime(elapsed)+' elapsed \u00b7 ~'+formatTime(eta)+' remaining';
+      } else {
+        timerEl.textContent=formatTime(elapsed)+' elapsed \u00b7 starting...';
+      }
+    }
 
     if(d.status==='done'){
       clearInterval(pollInterval);
@@ -902,7 +1145,6 @@ function loadPrompts(){
     selectStep(0);
   });
 }
-
 function renderStepNav(){
   const nav=document.getElementById('step-nav');
   nav.innerHTML=allPrompts.map((p,i)=>`
@@ -912,46 +1154,160 @@ function renderStepNav(){
       <span class="example-count">${p.num_examples} ex</span>
     </div>`).join('');
 }
-
 function selectStep(i){
-  activeStep=i;
-  renderStepNav();
-  const p=allPrompts[i];
+  activeStep=i; showAddForm=false;
+  renderStepNav(); renderStepEditor();
+}
+function setEditorMode(m){ editorMode=m; renderStepEditor(); }
+function toggleAddForm(){ showAddForm=!showAddForm; renderStepEditor(); }
+
+function renderStepEditor(){
+  const p=allPrompts[activeStep];
   const ed=document.getElementById('step-editor');
+  if(editorMode==='advanced'){
+    ed.innerHTML=`
+      <div class="step-title">${escHtml(p.label)}</div>
+      <div class="step-desc">${escHtml(p.desc)} \u2014 <code>${escHtml(p.file)}</code></div>
+      <div class="mode-toggle">
+        <button onclick="setEditorMode('simple')">Simple</button>
+        <button class="active" onclick="setEditorMode('advanced')">Advanced</button>
+      </div>
+      <label>Prompt Logic (Markdown)</label>
+      <textarea id="prompt-content" rows="18">${escHtml(p.content)}</textarea>
+      <label style="margin-top:0.75rem;">Few-Shot Examples (JSONL \u2014 one JSON per line)</label>
+      <textarea id="prompt-examples" rows="10">${escHtml(p.examples_raw||'')}</textarea>
+      <div class="btn-row">
+        <button class="btn btn-primary btn-sm" onclick="saveStepAdvanced()">Save Changes</button>
+        <button class="btn btn-ghost btn-sm" onclick="selectStep(${activeStep})">Revert</button>
+        <span class="saved-toast" id="save-toast">Saved!</span>
+      </div>`;
+    return;
+  }
+  // Simple mode
+  const examples=p.examples||[];
+  const cards=examples.map((ex,idx)=>renderExCard(ex,idx,p.step)).join('');
   ed.innerHTML=`
     <div class="step-title">${escHtml(p.label)}</div>
-    <div class="step-desc">${escHtml(p.desc)} &nbsp;—&nbsp; <code>${escHtml(p.file)}</code></div>
-
-    <label>Prompt Logic <span style="color:var(--dim)">(Markdown — edit freely)</span></label>
-    <textarea id="prompt-content" rows="18">${escHtml(p.content)}</textarea>
-
-    <label style="margin-top:1rem;">Few-Shot Examples <span style="color:var(--dim)">(JSONL — one JSON object per line)</span></label>
-    <textarea id="prompt-examples" rows="8" placeholder='{"title":"...","abstract":"...","expected":{...}}'>${escHtml(p.examples)}</textarea>
-
-    <div class="btn-row">
-      <button class="btn btn-primary btn-sm" onclick="saveStep(${i})">Save Changes</button>
-      <button class="btn btn-ghost btn-sm" onclick="selectStep(${i})">Revert</button>
-      <span class="saved-toast" id="save-toast">Saved!</span>
+    <div class="step-desc">${escHtml(p.desc)}</div>
+    <div class="mode-toggle">
+      <button class="active" onclick="setEditorMode('simple')">Simple</button>
+      <button onclick="setEditorMode('advanced')">Advanced</button>
     </div>
-  `;
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <span style="font-size:0.82rem;font-weight:600;">${examples.length} Training Examples</span>
+      <button class="btn btn-primary btn-sm" onclick="toggleAddForm()">${showAddForm?'\u2212 Cancel':'+ Add Example'}</button>
+    </div>
+    <div class="add-form ${showAddForm?'show':''}" id="add-form">${renderAddForm(p.step)}</div>
+    <div class="example-cards">${cards||'<div style="color:var(--dim);padding:1.5rem;text-align:center;grid-column:1/-1;">No examples yet. Click + Add Example above.</div>'}</div>
+    <span class="saved-toast" id="save-toast">Saved!</span>`;
 }
 
-function saveStep(i){
-  const p=allPrompts[i];
+function renderExCard(ex,idx,step){
+  const e=ex.expected||{};
+  let badges='';
+  if(e.status) badges+='<span class="badge-sm b-'+e.status.toLowerCase()+'">'+e.status+'</span> ';
+  if(e.exclusion_code) badges+='<span class="badge-sm" style="background:rgba(239,68,68,0.1);color:var(--red);">'+e.exclusion_code+'</span> ';
+  if(e.path) badges+='<span class="badge-sm" style="background:rgba(59,130,246,0.12);color:var(--accent);">'+e.path.replace('Path_A_CG_to_ESG','Path A').replace('Both_A_and_B','Both A+B').replace('Path_B_ESG_to_FP_with_CG_moderation','Path B')+'</span> ';
+  if(e.meta_potential) badges+='<span class="badge-sm b-'+e.meta_potential.toLowerCase()+'">'+e.meta_potential+'</span> ';
+  if(e.cg_mechanisms) e.cg_mechanisms.forEach(m=>{badges+='<span class="badge-sm" style="background:rgba(168,85,247,0.12);color:var(--purple);">'+m.replace(/_/g,' ')+'</span> ';});
+  if(e.esg_outcomes) e.esg_outcomes.forEach(m=>{badges+='<span class="badge-sm" style="background:rgba(249,115,22,0.12);color:var(--orange);">'+m.replace(/_/g,' ')+'</span> ';});
+  return '<div class="example-card">'+
+    '<button class="ec-delete" onclick="deleteExample(\''+step+'\','+idx+')" title="Delete">\u00d7</button>'+
+    '<div class="ec-title">'+escHtml((ex.title||'').substring(0,75))+'</div>'+
+    '<div class="ec-abstract">'+escHtml((ex.abstract||'').substring(0,100))+'...</div>'+
+    '<div class="ec-expected">'+badges+'</div></div>';
+}
+
+function renderAddForm(step){
+  let h='<label>Title</label><input type="text" id="ex-title" placeholder="Article title">';
+  h+='<label>Abstract</label><textarea id="ex-abstract" rows="2" placeholder="Article abstract" style="font-family:inherit;"></textarea>';
+  if(step==='screener'){
+    h+='<div class="form-row"><div><label>Status</label><select id="ex-status">';
+    STATUS_OPTIONS.forEach(s=>{h+='<option value="'+s+'">'+s+'</option>';});
+    h+='</select></div><div><label>Exclusion Code</label><select id="ex-code"><option value="">None</option>';
+    EXCLUSION_CODES.forEach(c=>{h+='<option value="'+c+'">'+c+'</option>';});
+    h+='</select></div></div>';
+  } else if(step==='path'){
+    h+='<label>Path</label><select id="ex-path">';
+    PATH_OPTIONS.forEach(p=>{h+='<option value="'+p+'">'+p.replace(/_/g,' ')+'</option>';});
+    h+='</select>';
+  } else if(step==='cg'){
+    h+='<label>CG Mechanisms</label><div class="checkbox-group">';
+    CG_MECHANISMS.forEach(m=>{h+='<label><input type="checkbox" class="ex-cg-cb" value="'+m+'"> '+m.replace(/_/g,' ')+'</label>';});
+    h+='</div>';
+  } else if(step==='esg'){
+    h+='<label>ESG Outcomes</label><div class="checkbox-group">';
+    ESG_OUTCOMES.forEach(m=>{h+='<label><input type="checkbox" class="ex-esg-cb" value="'+m+'"> '+m.replace(/_/g,' ')+'</label>';});
+    h+='</div>';
+  } else if(step==='meta'){
+    h+='<label>Meta Potential</label><select id="ex-meta">';
+    META_OPTIONS.forEach(m=>{h+='<option value="'+m+'">'+m+'</option>';});
+    h+='</select>';
+  }
+  h+='<div class="form-row" style="margin-top:0.5rem;"><div><label>Confidence (0.5\u20141.0)</label>';
+  h+='<input type="number" id="ex-conf" value="0.85" min="0.5" max="1" step="0.05"></div>';
+  h+='<div><label>Reasoning</label><input type="text" id="ex-reason" placeholder="Brief explanation"></div></div>';
+  h+='<div class="btn-row"><button class="btn btn-green btn-sm" onclick="saveNewExample()">Save Example</button>';
+  h+='<button class="btn btn-ghost btn-sm" onclick="toggleAddForm()">Cancel</button></div>';
+  return h;
+}
+
+function saveNewExample(){
+  const step=allPrompts[activeStep].step;
+  const title=document.getElementById('ex-title').value;
+  const abstract=document.getElementById('ex-abstract').value;
+  if(!title||!abstract){alert('Title and Abstract are required');return;}
+  const expected={};
+  if(step==='screener'){
+    expected.status=document.getElementById('ex-status').value;
+    const code=document.getElementById('ex-code').value;
+    if(code) expected.exclusion_code=code;
+  } else if(step==='path'){
+    expected.path=document.getElementById('ex-path').value;
+  } else if(step==='cg'){
+    expected.cg_mechanisms=[...document.querySelectorAll('.ex-cg-cb:checked')].map(cb=>cb.value);
+  } else if(step==='esg'){
+    expected.esg_outcomes=[...document.querySelectorAll('.ex-esg-cb:checked')].map(cb=>cb.value);
+  } else if(step==='meta'){
+    expected.meta_potential=document.getElementById('ex-meta').value;
+  }
+  const conf=parseFloat(document.getElementById('ex-conf').value);
+  if(conf) expected.confidence=conf;
+  const reason=document.getElementById('ex-reason').value;
+  if(reason) expected.reasoning=reason;
+  fetch('/api/examples/'+step,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({title,abstract,expected})
+  }).then(r=>r.json()).then(d=>{
+    if(d.ok){ showAddForm=false; loadPrompts(); showToast(); }
+  });
+}
+
+function deleteExample(step,index){
+  if(!confirm('Delete this example?')) return;
+  fetch('/api/examples/'+step+'/'+index,{method:'DELETE'}).then(r=>r.json()).then(d=>{
+    if(d.ok) loadPrompts();
+  });
+}
+
+function saveStepAdvanced(){
+  const p=allPrompts[activeStep];
   const content=document.getElementById('prompt-content').value;
   const examples=document.getElementById('prompt-examples').value;
   fetch('/api/prompts/'+p.step,{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({content,examples})
   }).then(r=>r.json()).then(d=>{
     if(d.ok){
-      allPrompts[i].content=content;
-      allPrompts[i].examples=examples;
-      allPrompts[i].num_examples=examples.trim()?examples.trim().split('\n').filter(l=>l.trim()).length:0;
-      renderStepNav();
-      const t=document.getElementById('save-toast');
-      t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2000);
+      allPrompts[activeStep].content=content;
+      allPrompts[activeStep].examples_raw=examples;
+      allPrompts[activeStep].num_examples=examples.trim()?examples.trim().split('\n').filter(l=>l.trim()).length:0;
+      renderStepNav(); showToast();
     }
   });
+}
+
+function showToast(){
+  const t=document.getElementById('save-toast');
+  if(t){t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2000);}
 }
 
 // --- Results Table ---
@@ -1040,7 +1396,7 @@ function renderResultsTable(){
         '<div class="detail-inner">'+
           Object.entries(l.step_results||{}).map(function(entry){
             var k=entry[0],v=entry[1];
-            return '<div class="detail-box"><h4>'+escHtml(k)+'</h4><pre>'+escHtml(typeof v==='object'?JSON.stringify(v,null,2):String(v))+'</pre></div>';
+            return '<div class="detail-box"><h4>'+escHtml(k)+' <span class="expand-btn" onclick="quickCorrect('+realIdx+',\''+k+'\')" style="float:right;font-size:0.65rem;">Correct</span></h4><pre>'+escHtml(typeof v==='object'?JSON.stringify(v,null,2):String(v))+'</pre><div id="qc-'+realIdx+'-'+k+'"></div></div>';
           }).join('')+
           (s.reasoning?'<div class="detail-box"><h4>Screening Reasoning</h4><pre>'+escHtml(s.reasoning)+'</pre></div>':'')+
         '</div>'+
@@ -1054,6 +1410,75 @@ function toggleDetail(idx){
   row.style.display=row.style.display==='none'?'table-row':'none';
 }
 
+// --- Quick Correct ---
+function quickCorrect(logIdx,stepName){
+  const container=document.getElementById('qc-'+logIdx+'-'+stepName);
+  if(container.innerHTML){container.innerHTML='';return;}
+  const log=allLogs[logIdx]; const s=log.summary||{};
+  let h='<div class="qc-form">';
+  if(stepName==='screener'){
+    h+='<select id="qcs-'+logIdx+'">';
+    STATUS_OPTIONS.forEach(v=>{h+='<option value="'+v+'"'+(v===s.status?' selected':'')+'>'+v+'</option>';});
+    h+='</select> <select id="qcc-'+logIdx+'"><option value="">No code</option>';
+    EXCLUSION_CODES.forEach(v=>{h+='<option value="'+v+'"'+(v===(s.exclusion_code||'')?' selected':'')+'>'+v+'</option>';});
+    h+='</select>';
+  } else if(stepName==='path'){
+    h+='<select id="qcp-'+logIdx+'">';
+    PATH_OPTIONS.forEach(v=>{h+='<option value="'+v+'"'+(v===s.path?' selected':'')+'>'+v.replace(/_/g,' ')+'</option>';});
+    h+='</select>';
+  } else if(stepName==='cg'){
+    const cur=(s.cg||'').split(';').filter(x=>x);
+    CG_MECHANISMS.forEach(m=>{
+      h+='<label><input type="checkbox" class="qccg'+logIdx+'" value="'+m+'"'+(cur.includes(m)?' checked':'')+'>'+m.replace(/_/g,' ')+'</label>';
+    });
+  } else if(stepName==='esg'){
+    const cur=(s.esg||'').split(';').filter(x=>x);
+    ESG_OUTCOMES.forEach(m=>{
+      h+='<label><input type="checkbox" class="qcesg'+logIdx+'" value="'+m+'"'+(cur.includes(m)?' checked':'')+'>'+m.replace(/_/g,' ')+'</label>';
+    });
+  } else if(stepName==='meta'){
+    h+='<select id="qcm-'+logIdx+'">';
+    META_OPTIONS.forEach(v=>{h+='<option value="'+v+'"'+(v===s.meta?' selected':'')+'>'+v+'</option>';});
+    h+='</select>';
+  }
+  h+='<div style="margin-top:0.3rem;"><button class="btn btn-green btn-sm" onclick="saveQC('+logIdx+',\''+stepName+'\')">Save as Example</button> ';
+  h+='<button class="btn btn-ghost btn-sm" onclick="document.getElementById(\'qc-'+logIdx+'-'+stepName+'\').innerHTML=\'\'">Cancel</button></div></div>';
+  container.innerHTML=h;
+}
+
+function saveQC(logIdx,stepName){
+  const log=allLogs[logIdx];
+  const title=log.title||'';
+  const abstract=log.abstract||'';
+  const expected={confidence:0.90,reasoning:'Corrected from pipeline results'};
+  if(stepName==='screener'){
+    expected.status=document.getElementById('qcs-'+logIdx).value;
+    const code=document.getElementById('qcc-'+logIdx).value;
+    if(code) expected.exclusion_code=code;
+  } else if(stepName==='path'){
+    expected.path=document.getElementById('qcp-'+logIdx).value;
+  } else if(stepName==='cg'){
+    expected.cg_mechanisms=[...document.querySelectorAll('.qccg'+logIdx+':checked')].map(cb=>cb.value);
+  } else if(stepName==='esg'){
+    expected.esg_outcomes=[...document.querySelectorAll('.qcesg'+logIdx+':checked')].map(cb=>cb.value);
+  } else if(stepName==='meta'){
+    expected.meta_potential=document.getElementById('qcm-'+logIdx).value;
+  }
+  fetch('/api/examples/'+stepName,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({title,abstract,expected})
+  }).then(r=>r.json()).then(d=>{
+    if(d.ok){
+      document.getElementById('qc-'+logIdx+'-'+stepName).innerHTML='<span class="qc-saved">Saved as example!</span>';
+    }
+  });
+}
+
+// --- Init ---
+document.addEventListener('DOMContentLoaded',function(){
+  updateModelDropdown();
+  loadSavedKey();
+});
+
 // --- Util ---
 function escHtml(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function escAttr(s){return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
@@ -1062,5 +1487,5 @@ function escAttr(s){return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').
 </html>"""
 
 if __name__ == "__main__":
-    print("\n  SLR Brain v2 — http://localhost:8080\n")
+    print("\n  SLR Brain v3 — http://localhost:8080\n")
     app.run(host="0.0.0.0", port=8080, debug=False)
